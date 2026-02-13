@@ -41,9 +41,19 @@ MAP_VENDOR_COL = "Vendor"
 # Coordinates in PDF space are from the bottom (0.0) to top (1.0).
 # These defaults remove header/footer areas where order/customer numbers often appear.
 CROP_CONFIG = {
-    "Home Depot": {"y0": 0.00, "y1": 0.70},      # bottom 70% (below header)
-    "Lowe's": {"y0": 0.12, "y1": 0.90},          # middle 78% (skip header/footer)
-    "Tractor Supply": {"y0": 0.10, "y1": 0.90},  # middle 80%
+    # NOTE: These regions are tuned to the packing slip "line items" / model-number area for each retailer.
+    # Fractions are relative to page height (0.0 = bottom, 1.0 = top).
+    # If a retailer changes their slip layout in the future, these are the only numbers you should need to adjust.
+
+    # Home Depot: the Model Number / Internet Number table sits in the lower half of the slip (above the footer).
+    "Home Depot": {"y0": 0.05, "y1": 0.60},
+
+    # Lowe's: the Item / Model # line-items table is mid-lower; headers contain long customer order numbers.
+    # SOS tags are detected from FULL text, but matching uses this cropped region.
+    "Lowe's": {"y0": 0.25, "y1": 0.70},
+
+    # Tractor Supply: the LINE/SKU/VENDOR PN table is mid-lower.
+    "Tractor Supply": {"y0": 0.25, "y1": 0.75},
 }
 
 
