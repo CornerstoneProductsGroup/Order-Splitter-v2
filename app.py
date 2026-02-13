@@ -178,7 +178,6 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[st
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
 
     vendor_pdfs = {}
-        st.session_state['vendor_pdfs'] = vendor_pdfs
     for vendor, idxs in pages_by_vendor.items():
         writer = PdfWriter()
         for i in idxs:
@@ -402,6 +401,7 @@ if _ensure_state_loaded():
     # Build vendor PDFs (from final Vendor column) + ZIP
     page_vendor_rows = [{"PageIndex": r["Page"] - 1, "Vendor": r["Vendor"]} for r in rows]
     vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
+    st.session_state['vendor_pdfs'] = vendor_pdfs
     warehouse_pdf = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
     zip_bytes = build_zip(vendor_pdfs, retailer, base_name=pdf_name, warehouse_print_pdf=warehouse_pdf)
 
