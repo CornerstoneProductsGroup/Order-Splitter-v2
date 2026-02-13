@@ -132,16 +132,22 @@ def match_vendor(text: str, lookup: dict) -> tuple[str, list[str], int]:
         return "MIXED/REVIEW", matched[:15], 25
 
     hit_count = len(set(matched))
-    if hit_count >= 4:
+
+    # Confidence calibration:
+    # - We intentionally bias upward because many order pages only contain 1 clear SKU/Model hit.
+    # - Still keeps MIXED/UNKNOWN low.
+    if hit_count >= 5:
+        conf = 98
+    elif hit_count == 4:
         conf = 95
     elif hit_count == 3:
-        conf = 90
+        conf = 92
     elif hit_count == 2:
-        conf = 80
+        conf = 88
     elif hit_count == 1:
-        conf = 65
+        conf = 80
     else:
-        conf = 50
+        conf = 60
 
     return next(iter(vendors)), matched[:15], conf
 
@@ -169,12 +175,21 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[st
     return vendor_pdfs
 
 
-def build_zip(vendor_pdfs: dict[str, bytes], retailer: str) -> bytes:
+def build_zip(vendor_pdfs: dict[str, bytes], retailer: str, base_name: str) -> bytes:
+    """
+    Build a ZIP containing one PDF per vendor.
+    Vendor PDF filenames are derived from the uploaded PDF filename:
+      <base_name> - <Vendor>.pdf
+    """
     buff = BytesIO()
+    # Clean base name (no extension)
+    base = re.sub(r"\.pdf$", "", base_name, flags=re.IGNORECASE).strip()
+    base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or retailer.replace(" ", "")
+
     with zipfile.ZipFile(buff, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for vendor, pdf_data in vendor_pdfs.items():
-            safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
-            filename = f"{retailer} - {safe_vendor}.pdf"
+            safe_vendor = re.sub(r"[^\w\-\. ]+", "_", vendor).strip() or "UNKNOWN"
+            filename = f"{base} - {safe_vendor}.pdf"
             z.writestr(filename, pdf_data)
     return buff.getvalue()
 
@@ -233,6 +248,7 @@ def _process_pdf_and_store_state():
         return
 
     pdf_bytes = pdf_file.read()
+    pdf_name = getattr(pdf_file, 'name', 'uploaded.pdf')
 
     # Load map and lookup
     try:
@@ -290,6 +306,7 @@ def _process_pdf_and_store_state():
     st.session_state[f"rows_{retailer}"] = rows
     st.session_state[f"lookup_{retailer}"] = lookup
     st.session_state[f"pdfbytes_{retailer}"] = pdf_bytes
+    st.session_state[f"pdfname_{retailer}"] = pdf_name
     st.session_state[f"vendors_{retailer}"] = vendor_list_extended
 
 if process:
@@ -298,6 +315,7 @@ if process:
 if _ensure_state_loaded():
     rows = st.session_state[f"rows_{retailer}"]
     pdf_bytes = st.session_state[f"pdfbytes_{retailer}"]
+    pdf_name = st.session_state.get(f"pdfname_{retailer}", f"{retailer}.pdf")
     vendor_list_extended = st.session_state[f"vendors_{retailer}"]
 
     df_report = pd.DataFrame(rows)
@@ -308,13 +326,13 @@ if _ensure_state_loaded():
     # Build vendor PDFs (from final Vendor column) + ZIP
     page_vendor_rows = [{"PageIndex": r["Page"] - 1, "Vendor": r["Vendor"]} for r in rows]
     vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
-    zip_bytes = build_zip(vendor_pdfs, retailer)
+    zip_bytes = build_zip(vendor_pdfs, retailer, base_name=pdf_name)
 
     st.subheader("Downloads")
     st.download_button(
         "Download Vendor ZIP",
         data=zip_bytes,
-        file_name=f"{retailer.replace(' ', '')}_VendorPdfs.zip",
+        file_name=f"{re.sub(r'\.pdf$', '', pdf_name, flags=re.IGNORECASE)}_VendorPdfs.zip",
         mime="application/zip"
     )
 
