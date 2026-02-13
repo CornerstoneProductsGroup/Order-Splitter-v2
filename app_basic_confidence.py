@@ -11,6 +11,18 @@ from pypdf import PdfReader, PdfWriter
 # -----------------------------
 # Defaults (packaged in repo)
 # -----------------------------
+# Vendors we ship from our own warehouse (used to create a combined print file)
+WAREHOUSE_VENDORS = [
+    "Cord Mate",
+    "Gate Latch",
+    "Home Selects",
+    "Nisus",
+    "Post Protector-Here",
+    "Soft Seal",
+    "Weedshark",
+    "Zaca",
+]
+
 DEFAULT_MAPS = {
     "Home Depot": "vendor_map_hd.xlsx",
     "Lowe's": "vendor_map_lowes.xlsx",
@@ -174,12 +186,49 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[st
 
     return vendor_pdfs
 
+def build_warehouse_print_pdf(pdf_bytes: bytes, page_vendor_rows: list[dict], vendors: list[str]) -> bytes | None:
+    """
+    Build a single PDF that concatenates pages for a set of vendors (e.g., warehouse-shipped items).
+    Ordering:
+      - Vendors in alphabetical order (case-insensitive)
+      - Pages within each vendor in ascending page order
+    Returns bytes for the combined PDF, or None if no pages matched.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
 
-def build_zip(vendor_pdfs: dict[str, bytes], retailer: str, base_name: str) -> bytes:
+    pages_by_vendor = defaultdict(list)
+    for r in page_vendor_rows:
+        pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
+
+    # Normalize vendor membership check (exact match by name)
+    target = [v for v in vendors if v in pages_by_vendor]
+
+    if not target:
+        return None
+
+    writer = PdfWriter()
+    for vendor in sorted(target, key=lambda x: x.lower()):
+        for i in sorted(pages_by_vendor[vendor]):
+            writer.add_page(reader.pages[i])
+
+    buff = BytesIO()
+    writer.write(buff)
+    return buff.getvalue()
+
+
+def build_zip(
+    vendor_pdfs: dict[str, bytes],
+    retailer: str,
+    base_name: str,
+    warehouse_print_pdf: bytes | None = None,
+) -> bytes:
     """
     Build a ZIP containing one PDF per vendor.
     Vendor PDF filenames are derived from the uploaded PDF filename:
       <base_name> - <Vendor>.pdf
+
+    If warehouse_print_pdf is provided, also includes:
+      <base_name> - WAREHOUSE PRINT.pdf
     """
     buff = BytesIO()
     # Clean base name (no extension)
@@ -187,6 +236,10 @@ def build_zip(vendor_pdfs: dict[str, bytes], retailer: str, base_name: str) -> b
     base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or retailer.replace(" ", "")
 
     with zipfile.ZipFile(buff, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        # Optional combined print file first (handy for quick printing)
+        if warehouse_print_pdf is not None:
+            z.writestr(f"{base} - WAREHOUSE PRINT.pdf", warehouse_print_pdf)
+
         for vendor, pdf_data in vendor_pdfs.items():
             safe_vendor = re.sub(r"[^\w\-\. ]+", "_", vendor).strip() or "UNKNOWN"
             filename = f"{base} - {safe_vendor}.pdf"
@@ -326,7 +379,8 @@ if _ensure_state_loaded():
     # Build vendor PDFs (from final Vendor column) + ZIP
     page_vendor_rows = [{"PageIndex": r["Page"] - 1, "Vendor": r["Vendor"]} for r in rows]
     vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
-    zip_bytes = build_zip(vendor_pdfs, retailer, base_name=pdf_name)
+    warehouse_pdf = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
+    zip_bytes = build_zip(vendor_pdfs, retailer, base_name=pdf_name, warehouse_print_pdf=warehouse_pdf)
 
     st.subheader("Downloads")
     st.download_button(
