@@ -3,12 +3,7 @@ import pandas as pd
 from io import BytesIO
 import zipfile
 import re
-import json
-import io
 from collections import defaultdict
-
-import fitz  # PyMuPDF
-from PIL import Image, ImageDraw
 
 from pypdf import PdfReader, PdfWriter
 
@@ -16,19 +11,7 @@ from pypdf import PdfReader, PdfWriter
 # -----------------------------
 # Defaults (packaged in repo)
 # -----------------------------
-DEFAULT_MAPS = {
-    "Home Depot": "vendor_map_hd.xlsx",
-    "Lowe's": "vendor_map_lowes.xlsx",
-    "Tractor Supply": "vendor_map_tsc.xlsx",
-}
-
-MAP_KEY_COL = {
-    "Home Depot": "Model Number",
-    "Lowe's": "SKU",
-    "Tractor Supply": "SKU",
-}
-MAP_VENDOR_COL = "Vendor"
-
+# Vendors we ship from our own warehouse (used to create a combined print file)
 WAREHOUSE_VENDORS = [
     "Cord Mate",
     "Gate Latch",
@@ -40,38 +23,78 @@ WAREHOUSE_VENDORS = [
     "Zaca",
 ]
 
-CROP_CONFIG_PATH = "crop_config.json"
+DEFAULT_MAPS = {
+    "Home Depot": "vendor_map_hd.xlsx",
+    "Lowe's": "vendor_map_lowes.xlsx",
+    "Tractor Supply": "vendor_map_tsc.xlsx",
+}
 
-# Default scan rectangles per retailer (fractions of page width/height; 0..1).
-# Fractions use PDF coordinates: x from left, y from bottom.
-CROP_CONFIG_DEFAULTS = {
-    "Home Depot": {"x0": 0.10, "x1": 0.95, "y0": 0.30, "y1": 0.75},
-    "Lowe's": {"x0": 0.10, "x1": 0.95, "y0": 0.35, "y1": 0.80},
-    "Tractor Supply": {"x0": 0.10, "x1": 0.95, "y0": 0.30, "y1": 0.85},
+# Column names differ slightly by retailer
+MAP_KEY_COL = {
+    "Home Depot": "Model Number",
+    "Lowe's": "SKU",
+    "Tractor Supply": "SKU",
+}
+MAP_VENDOR_COL = "Vendor"
+
+# Text-extraction crop regions (fractions of page height).
+# Coordinates in PDF space are from the bottom (0.0) to top (1.0).
+# These defaults remove header/footer areas where order/customer numbers often appear.
+CROP_CONFIG = {
+    # NOTE: These regions are tuned to the packing slip "line items" / model-number area for each retailer.
+    # Fractions are relative to page height (0.0 = bottom, 1.0 = top).
+    # If a retailer changes their slip layout in the future, these are the only numbers you should need to adjust.
+
+    # Home Depot: the Model Number / Internet Number table sits in the lower half of the slip (above the footer).
+    "Home Depot": {"y0": 0.05, "y1": 0.60},
+
+    # Lowe's: the Item / Model # line-items table is mid-lower; headers contain long customer order numbers.
+    # SOS tags are detected from FULL text, but matching uses this cropped region.
+    "Lowe's": {"y0": 0.25, "y1": 0.70},
+
+    # Tractor Supply: the LINE/SKU/VENDOR PN table is mid-lower.
+    "Tractor Supply": {"y0": 0.25, "y1": 0.75},
 }
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def normalize_key(x: str) -> str:
+    """Normalize SKU/Model strings for matching."""
     if x is None:
         return ""
     s = str(x).strip().upper()
+    # remove spaces and common separators
     s = re.sub(r"[\s\-_]", "", s)
     return s
 
 
 def load_vendor_map(retailer: str, uploaded_file=None) -> pd.DataFrame:
+    """
+    Load a vendor map for the retailer.
+    Priority:
+      1) Uploaded file (if provided)
+      2) Packaged default file in repo
+    """
     if uploaded_file is not None:
-        return pd.read_excel(uploaded_file)
-    return pd.read_excel(DEFAULT_MAPS[retailer])
+        df = pd.read_excel(uploaded_file)
+        return df
+
+    default_path = DEFAULT_MAPS[retailer]
+    df = pd.read_excel(default_path)
+    return df
 
 
 def build_lookup(df: pd.DataFrame, retailer: str) -> dict:
+    """Build dict: normalized SKU/Model -> Vendor"""
     key_col = MAP_KEY_COL[retailer]
     if key_col not in df.columns or MAP_VENDOR_COL not in df.columns:
         raise ValueError(
             f"Vendor map for {retailer} must include columns: '{key_col}' and '{MAP_VENDOR_COL}'. "
             f"Found: {list(df.columns)}"
         )
+
     lookup = {}
     for _, row in df.iterrows():
         k = normalize_key(row.get(key_col))
@@ -81,120 +104,137 @@ def build_lookup(df: pd.DataFrame, retailer: str) -> dict:
     return lookup
 
 
-def is_sos_tag_page(text: str) -> bool:
-    t = (text or "").upper()
-    keywords = ["SOS", "SHIP TO STORE", "STORE PICKUP", "PICK UP IN STORE", "S2S", "SPECIAL ORDER"]
-    return any(k in t for k in keywords)
+def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str) -> list[dict]:
+    """
+    Return a list of dicts per page:
+      {"full": <full page text>, "region": <cropped region text>}
+    Region cropping is used for vendor matching to avoid false positives from headers/footers.
+    """
+    from copy import copy
+    from pypdf.generic import RectangleObject
 
-
-def load_crop_config() -> dict:
-    try:
-        import os
-        if os.path.exists(CROP_CONFIG_PATH):
-            with open(CROP_CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                for r, d in CROP_CONFIG_DEFAULTS.items():
-                    data.setdefault(r, d)
-                return data
-    except Exception:
-        pass
-    return dict(CROP_CONFIG_DEFAULTS)
-
-
-def save_crop_config(cfg: dict) -> bool:
-    try:
-        with open(CROP_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-        return True
-    except Exception:
-        return False
-
-
-def render_scan_area_overlay(pdf_bytes: bytes, page_index: int, rect_cfg: dict, zoom: float = 2.0) -> bytes:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_index = max(0, min(page_index, doc.page_count - 1))
-    page = doc.load_page(page_index)
-
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    draw = ImageDraw.Draw(img)
-
-    h = page.rect.height
-    w = page.rect.width
-
-    x0f = float(rect_cfg.get("x0", 0.0)); x1f = float(rect_cfg.get("x1", 1.0))
-    y0f = float(rect_cfg.get("y0", 0.0)); y1f = float(rect_cfg.get("y1", 1.0))
-    if x1f < x0f: x0f, x1f = x1f, x0f
-    if y1f < y0f: y0f, y1f = y1f, y0f
-
-    left = x0f * w
-    right = x1f * w
-    top = (1 - y1f) * h
-    bottom = (1 - y0f) * h
-
-    left *= zoom; right *= zoom; top *= zoom; bottom *= zoom
-    draw.rectangle([left, top, right, bottom], outline="red", width=6)
-
-    buff = io.BytesIO()
-    img.save(buff, format="PNG")
-    return buff.getvalue()
-
-
-def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg: dict) -> list[dict]:
-    cfg = crop_cfg.get(retailer, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
-    x0f = float(cfg.get("x0", 0.0)); x1f = float(cfg.get("x1", 1.0))
-    y0f = float(cfg.get("y0", 0.0)); y1f = float(cfg.get("y1", 1.0))
-    if x1f < x0f: x0f, x1f = x1f, x0f
-    if y1f < y0f: y0f, y1f = y1f, y0f
+    cfg = CROP_CONFIG.get(retailer, {"y0": 0.0, "y1": 1.0})
+    y0_frac = float(cfg.get("y0", 0.0))
+    y1_frac = float(cfg.get("y1", 1.0))
 
     reader = PdfReader(BytesIO(pdf_bytes))
     out = []
 
     for page in reader.pages:
+        # Full text (used for SOS detection and general fallback)
         try:
             full_text = page.extract_text() or ""
         except Exception:
             full_text = ""
 
+        # Region text (used for SKU/Model matching)
         try:
+            # Copy the page object so we don't mutate the original
+            p2 = copy(page)
+
+            # Determine page bounds
             mb = page.mediabox
-            left = float(mb.left); right = float(mb.right)
-            bottom = float(mb.bottom); top = float(mb.top)
-            w = right - left; h = top - bottom
+            x0 = float(mb.left)
+            x1 = float(mb.right)
+            h = float(mb.top) - float(mb.bottom)
 
-            x0 = left + x0f * w
-            x1 = left + x1f * w
-            y0 = bottom + y0f * h
-            y1 = bottom + y1f * h
+            ry0 = float(mb.bottom) + y0_frac * h
+            ry1 = float(mb.bottom) + y1_frac * h
 
-            chunks = []
+            # Clamp
+            ry0 = max(float(mb.bottom), min(ry0, float(mb.top)))
+            ry1 = max(float(mb.bottom), min(ry1, float(mb.top)))
+            if ry1 <= ry0:
+                ry0, ry1 = float(mb.bottom), float(mb.top)
 
-            def visitor_text(text, cm, tm, font_dict, font_size):
-                try:
-                    x = float(tm[4]); y = float(tm[5])
-                except Exception:
-                    return
-                if x0 <= x <= x1 and y0 <= y <= y1:
-                    chunks.append(text)
+            p2.cropbox = RectangleObject([x0, ry0, x1, ry1])
 
-            page.extract_text(visitor_text=visitor_text)
-            region_text = "".join(chunks)
-            if not region_text.strip():
-                region_text = full_text
+            region_text = p2.extract_text() or ""
         except Exception:
+            # Fallback if crop-based extraction fails
             region_text = full_text
 
         out.append({"full": full_text, "region": region_text})
 
     return out
 
+def extract_search_region(text: str, retailer: str) -> str:
+    """
+    Limit the text region used for SKU/Model matching to reduce false positives.
+
+    Home Depot: Only scan the items table area (below the 'Model Number' header),
+    stopping before the footer (e.g., 'Page:' / thank-you line).
+    Other retailers: scan full page text.
+    """
+    if retailer != "Home Depot":
+        return text or ""
+
+    if not text:
+        return ""
+
+    lines = [ln.strip() for ln in (text.splitlines() or [])]
+
+    header_idx = None
+    for i, ln in enumerate(lines):
+        up = ln.upper()
+        if "MODEL NUMBER" in up and ("INTERNET NUMBER" in up or "ITEM DESCRIPTION" in up):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        return text  # fallback
+
+    start = header_idx + 1
+
+    end = len(lines)
+    for j in range(start, len(lines)):
+        up = lines[j].upper()
+        if up.startswith("PAGE:") or "THANK YOU FOR SHOPPING AT THE HOME DEPOT" in up:
+            end = j
+            break
+
+    region = "\n".join(lines[start:end]).strip()
+    return region if region else text
+
+
+
+
+
+def is_sos_tag_page(text: str) -> bool:
+    """
+    Heuristic detector for Lowe's SOS (Ship-to-Store) tag/label pages.
+    These pages typically follow the order page and should inherit the prior page's vendor.
+    """
+    t_raw = (text or "").upper()
+    # Common signals. Adjust/add as you encounter variants in real PDFs.
+    keywords = [
+        "SOS",               # SOS tag
+        "SHIP TO STORE",
+        "STORE PICKUP",
+        "PICK UP IN STORE",
+        "S2S",               # sometimes used shorthand
+        "SPECIAL ORDER",     # sometimes appears near SOS wording
+    ]
+    return any(k in t_raw for k in keywords)
 
 def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str], int]:
+    """
+    Find SKUs/Models present in page text.
+    Returns:
+      (vendor, matched_keys, confidence_percent)
+
+    Confidence is a heuristic:
+      - UNKNOWN: 0%
+      - MIXED/REVIEW: 25%
+      - Single-vendor pages: confidence rises with number of SKU/Model hits
+    """
+        # Normalize the cropped region text (header/footer removed)
     t = normalize_key(text)
+
     matched = []
     vendors = set()
 
+    # Fast-ish approach: check each key as substring of normalized page text
     for k, vendor in lookup.items():
         if k and k in t:
             matched.append(k)
@@ -202,10 +242,14 @@ def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str]
 
     if not vendors:
         return "UNKNOWN", [], 0
+
     if len(vendors) > 1:
         return "MIXED/REVIEW", matched[:15], 25
 
     hit_count = len(set(matched))
+
+    # Confidence calibration:
+    # Many order pages only contain 1 clear SKU/Model hit; bias upward while keeping MIXED/UNKNOWN low.
     if hit_count >= 5:
         conf = 98
     elif hit_count == 4:
@@ -223,7 +267,12 @@ def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str]
 
 
 def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[str, bytes]:
+    """
+    Rebuild each vendor PDF from the original PDF using the page->vendor assignments.
+    This avoids 'overwrite' bugs and guarantees each vendor contains all its pages.
+    """
     reader = PdfReader(BytesIO(pdf_bytes))
+
     pages_by_vendor = defaultdict(list)
     for r in page_vendor_rows:
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
@@ -236,11 +285,19 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[st
         buff = BytesIO()
         writer.write(buff)
         vendor_pdfs[vendor] = buff.getvalue()
+
     return vendor_pdfs
 
-
 def build_warehouse_print_pdf(pdf_bytes: bytes, page_vendor_rows: list[dict], vendors: list[str]) -> bytes | None:
+    """
+    Build a single PDF that concatenates pages for a set of vendors (e.g., warehouse-shipped items).
+    Ordering:
+      - Vendors in alphabetical order (case-insensitive)
+      - Pages within each vendor in ascending page order
+    Returns bytes for the combined PDF, or None if no pages matched.
+    """
     reader = PdfReader(BytesIO(pdf_bytes))
+
     pages_by_vendor = defaultdict(list)
     for r in page_vendor_rows:
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
@@ -259,7 +316,21 @@ def build_warehouse_print_pdf(pdf_bytes: bytes, page_vendor_rows: list[dict], ve
     return buff.getvalue()
 
 
-def build_zip(vendor_pdfs: dict[str, bytes], retailer: str, base_name: str, warehouse_print_pdf: bytes | None = None) -> bytes:
+def build_zip(
+    vendor_pdfs: dict[str, bytes],
+    retailer: str,
+    base_name: str,
+    warehouse_print_pdf: bytes | None = None,
+) -> bytes:
+    """
+    Build a ZIP containing one PDF per vendor.
+
+    Filenames:
+      <base_name> - <Vendor>.pdf
+
+    If warehouse_print_pdf is provided, also includes:
+      <base_name> - WAREHOUSE PRINT.pdf
+    """
     buff = BytesIO()
     base = re.sub(r"\.pdf$", "", base_name, flags=re.IGNORECASE).strip()
     base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or retailer.replace(" ", "")
@@ -267,299 +338,278 @@ def build_zip(vendor_pdfs: dict[str, bytes], retailer: str, base_name: str, ware
     with zipfile.ZipFile(buff, "w", compression=zipfile.ZIP_DEFLATED) as z:
         if warehouse_print_pdf is not None:
             z.writestr(f"{base} - WAREHOUSE PRINT.pdf", warehouse_print_pdf)
-        for vendor, pdf_data in vendor_pdfs.items():
-            safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
-            z.writestr(f"{base} - {safe_vendor}.pdf", pdf_data)
 
+        for vendor, pdf_data in vendor_pdfs.items():
+            safe_vendor = re.sub(r"[^\w\-\. ]+", "_", vendor).strip() or "UNKNOWN"
+            filename = f"{base} - {safe_vendor}.pdf"
+            z.writestr(filename, pdf_data)
     return buff.getvalue()
 
 
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="Retail Order Splitter", layout="wide")
-st.title("Retail Order Splitter")
+# UI
+# -----------------------------
+st.set_page_config(page_title="Retail Order Splitter (Basic)", layout="wide")
+st.title("Retail Order Splitter (Basic)")
 
-if "crop_cfg" not in st.session_state:
-    st.session_state["crop_cfg"] = load_crop_config()
+st.caption(
+    "Upload a PDF. The app scans each page for SKUs/Models from the vendor map, assigns a vendor, "
+    "then builds a ZIP with one PDF per vendor containing *all* pages for that vendor. "
+    "Lowe's SOS tag pages inherit the vendor from the prior page."
+)
 
-tab_splitter, tab_tuning = st.tabs(["Order Splitter", "Scan Area Tuning"])
+retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], index=1)
 
-with tab_tuning:
-    st.subheader("Scan Area Tuning")
-    st.caption(
-        "Due to Streamlit component compatibility on Streamlit Cloud, this version uses sliders instead of drag-drop. "
-        "Adjust x/y bounds and preview the red box overlay."
-    )
+confidence_threshold = st.slider(
+    "Confidence threshold (pages below this will be flagged as REVIEW)",
+    min_value=0,
+    max_value=100,
+    value=70,
+    step=5,
+    help="If a page's confidence is below the threshold, it will be labeled REVIEW instead of being assigned to a vendor."
+)
 
-    t_retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], index=1, key="tuning_retailer")
-    crop_cfg = st.session_state.get("crop_cfg", load_crop_config())
-    cur = crop_cfg.get(t_retailer, CROP_CONFIG_DEFAULTS.get(t_retailer, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0}))
+with st.expander("Vendor Map (built in by default)"):
+    st.write(f"Default map file: `{DEFAULT_MAPS[retailer]}`")
+    st.write("If you upload a map here, it will be used for this run only (it won't persist after a redeploy).")
+    map_upload = st.file_uploader(f"Optional: Upload a {retailer} vendor map (xlsx)", type=["xlsx"], key=f"map_{retailer}")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        x0 = st.slider("Left (x0)", 0.0, 1.0, float(cur.get("x0", 0.0)), 0.01)
-        y0 = st.slider("Bottom (y0)", 0.0, 1.0, float(cur.get("y0", 0.0)), 0.01)
-    with c2:
-        x1 = st.slider("Right (x1)", 0.0, 1.0, float(cur.get("x1", 1.0)), 0.01)
-        y1 = st.slider("Top (y1)", 0.0, 1.0, float(cur.get("y1", 1.0)), 0.01)
+pdf_file = st.file_uploader(f"Upload {retailer} PDF", type=["pdf"], key=f"pdf_{retailer}")
 
-    if x1 < x0 or y1 < y0:
-        st.warning("Right must be > Left and Top must be > Bottom. The app will swap internally, but fix it here.")
+colA, colB = st.columns([1, 1])
+with colA:
+    process = st.button("Process PDF", type="primary", disabled=(pdf_file is None))
+with colB:
+    clear = st.button("Clear Results", disabled=(f"rows_{retailer}" not in st.session_state))
 
-    pdf_preview = st.file_uploader("Upload a PDF to preview", type=["pdf"], key="tuning_pdf")
-    page_preview = st.number_input("Preview page number", min_value=1, value=1, step=1, key="tuning_page")
+if clear:
+    for k in [f"rows_{retailer}", f"lookup_{retailer}", f"pdfbytes_{retailer}", f"vendors_{retailer}"]:
+        if k in st.session_state:
+            del st.session_state[k]
+    st.rerun()
 
-    # Update in-session config live
-    xx0, xx1 = float(x0), float(x1)
-    yy0, yy1 = float(y0), float(y1)
-    if xx1 < xx0: xx0, xx1 = xx1, xx0
-    if yy1 < yy0: yy0, yy1 = yy1, yy0
+def _ensure_state_loaded():
+    if f"rows_{retailer}" not in st.session_state:
+        return False
+    return True
 
-    crop_cfg[t_retailer] = {"x0": xx0, "x1": xx1, "y0": yy0, "y1": yy1}
-    st.session_state["crop_cfg"] = crop_cfg
+def _process_pdf_and_store_state():
+    if pdf_file is None:
+        return
 
-    cA, cB, cC = st.columns([1,1,1])
-    with cA:
-        show_box = st.button("Show scan area", key="tuning_show")
-    with cB:
-        save_defaults = st.button("Save as default", key="tuning_save")
-    with cC:
-        st.download_button(
-            "Download config JSON",
-            data=json.dumps(crop_cfg, indent=2).encode("utf-8"),
-            file_name="crop_config.json",
-            mime="application/json",
-            key="tuning_dl",
-        )
+    pdf_bytes = pdf_file.read()
+    pdf_name = getattr(pdf_file, 'name', 'uploaded.pdf')
 
-    cfg_upload = st.file_uploader("Upload config JSON (optional)", type=["json"], key="tuning_cfg_up")
-    if cfg_upload is not None:
-        try:
-            uploaded_cfg = json.load(cfg_upload)
-            if isinstance(uploaded_cfg, dict):
-                for r, d in CROP_CONFIG_DEFAULTS.items():
-                    uploaded_cfg.setdefault(r, d)
-                st.session_state["crop_cfg"] = uploaded_cfg
-                crop_cfg = uploaded_cfg
-                st.success("Loaded config JSON into this session.")
-        except Exception as e:
-            st.error(f"Could not load config JSON: {e}")
+    # Load map and lookup
+    try:
+        df_map = load_vendor_map(retailer, uploaded_file=map_upload)
+        lookup = build_lookup(df_map, retailer)
+    except Exception as e:
+        st.error(f"Vendor map error: {e}")
+        st.stop()
 
-    if save_defaults:
-        ok = save_crop_config(st.session_state.get("crop_cfg", crop_cfg))
-        if ok:
-            st.success("Saved scan area defaults to crop_config.json.")
-            st.caption("For persistence after Streamlit sleep, commit crop_config.json to your repo.")
-        else:
-            st.error("Could not save crop_config.json in this environment.")
+    # Vendor list (from map) for dropdowns + special buckets
+    vendor_list = sorted(set(lookup.values()))
+    vendor_list_extended = vendor_list + ["REVIEW", "UNKNOWN", "MIXED/REVIEW"]
 
-    if show_box:
-        if pdf_preview is None:
-            st.warning("Upload a PDF first.")
-        else:
-            try:
-                overlay = render_scan_area_overlay(pdf_preview.getvalue(), int(page_preview) - 1, crop_cfg[t_retailer], zoom=2.0)
-                st.image(overlay, caption=f"{t_retailer} scan area preview (page {int(page_preview)})", use_container_width=True)
-            except Exception as e:
-                st.error(f"Could not render preview: {e}")
+    with st.spinner("Reading PDF and matching vendors..."):
+        pages = extract_text_by_page_with_regions(pdf_bytes, retailer)
 
+    rows = []
+    for i, page_obj in enumerate(pages):
+        full_text = page_obj.get("full", "")
+        region_text = page_obj.get("region", full_text)
 
-with tab_splitter:
-    st.caption("Matching uses the scan rectangle from the Scan Area Tuning tab. Lowe's SOS tags inherit prior page vendor.")
-
-    retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], index=1, key="splitter_retailer")
-
-    confidence_threshold = st.slider(
-        "Confidence threshold (pages below this will be flagged as REVIEW)",
-        min_value=0,
-        max_value=100,
-        value=70,
-        step=5,
-    )
-
-    with st.expander("Vendor Map (built in by default)"):
-        st.write(f"Default map file: `{DEFAULT_MAPS[retailer]}`")
-        map_upload = st.file_uploader(f"Optional: Upload a {retailer} vendor map (xlsx)", type=["xlsx"], key=f"map_{retailer}")
-
-    pdf_file = st.file_uploader(f"Upload {retailer} PDF", type=["pdf"], key=f"pdf_{retailer}")
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        process = st.button("Process PDF", type="primary", disabled=(pdf_file is None), key="process_btn")
-    with colB:
-        clear = st.button("Clear Results", disabled=(f"rows_{retailer}" not in st.session_state), key="clear_btn")
-
-    if clear:
-        for k in [f"rows_{retailer}", f"lookup_{retailer}", f"pdfbytes_{retailer}", f"vendors_{retailer}", f"pdfname_{retailer}"]:
-            st.session_state.pop(k, None)
-        st.rerun()
-
-    def _ensure_state_loaded():
-        return f"rows_{retailer}" in st.session_state
-
-    def _process_pdf_and_store_state():
-        if pdf_file is None:
-            return
-
-        pdf_bytes = pdf_file.read()
-        pdf_name = getattr(pdf_file, "name", "uploaded.pdf")
-
-        try:
-            df_map = load_vendor_map(retailer, uploaded_file=map_upload)
-            lookup = build_lookup(df_map, retailer)
-        except Exception as e:
-            st.error(f"Vendor map error: {e}")
-            st.stop()
-
-        vendor_list = sorted(set(lookup.values()))
-        vendor_list_extended = vendor_list + ["REVIEW", "UNKNOWN", "MIXED/REVIEW"]
-
-        with st.spinner("Reading PDF and matching vendors..."):
-            crop_cfg = st.session_state.get("crop_cfg", load_crop_config())
-            pages = extract_text_by_page_with_regions(pdf_bytes, retailer, crop_cfg)
-
-        rows = []
-        for i, page_obj in enumerate(pages):
-            full_text = page_obj.get("full", "")
-            region_text = page_obj.get("region", full_text)
-
-            if retailer == "Lowe's" and is_sos_tag_page(full_text):
-                if rows:
-                    final_vendor = rows[-1]["Vendor"]
-                    detected_vendor = rows[-1].get("Detected Vendor", final_vendor)
-                    confidence = max(int(rows[-1].get("Confidence %", 0)), 80)
-                else:
-                    final_vendor = "REVIEW"
-                    detected_vendor = "SOS (no prior page)"
-                    confidence = 50
-
-                rows.append({
-                    "Page": i + 1,
-                    "Vendor": final_vendor,
-                    "Detected Vendor": detected_vendor,
-                    "Confidence %": confidence,
-                    "Matched SKU/Model (first 15)": "",
-                })
-                continue
-
-            vendor, matched, confidence = match_vendor(region_text, lookup, retailer)
-
-            final_vendor = vendor
-            if confidence < confidence_threshold and vendor not in ("UNKNOWN", "MIXED/REVIEW"):
+        # Lowe's SOS tag pages: inherit vendor from the prior page (the order page)
+        if retailer == "Lowe's" and is_sos_tag_page(full_text):
+            if rows:
+                final_vendor = rows[-1]["Vendor"]
+                detected_vendor = rows[-1].get("Detected Vendor", final_vendor)
+                confidence = max(int(rows[-1].get("Confidence %", 0)), 80)
+            else:
                 final_vendor = "REVIEW"
+                detected_vendor = "SOS (no prior page)"
+                confidence = 50
 
             rows.append({
                 "Page": i + 1,
                 "Vendor": final_vendor,
-                "Detected Vendor": vendor,
+                "Detected Vendor": detected_vendor,
                 "Confidence %": confidence,
-                "Matched SKU/Model (first 15)": ", ".join(matched) if matched else ""
+                "Matched SKU/Model (first 15)": "",
             })
+            continue
 
-        st.session_state[f"rows_{retailer}"] = rows
-        st.session_state[f"lookup_{retailer}"] = lookup
-        st.session_state[f"pdfbytes_{retailer}"] = pdf_bytes
-        st.session_state[f"pdfname_{retailer}"] = pdf_name
-        st.session_state[f"vendors_{retailer}"] = vendor_list_extended
+        vendor, matched, confidence = match_vendor(region_text, lookup, retailer)
 
-    if process:
-        _process_pdf_and_store_state()
+        # Apply threshold: low-confidence pages get routed to REVIEW
+        final_vendor = vendor
+        if confidence < confidence_threshold and vendor not in ("UNKNOWN", "MIXED/REVIEW"):
+            final_vendor = "REVIEW"
 
-    if _ensure_state_loaded():
-        rows = st.session_state[f"rows_{retailer}"]
-        pdf_bytes = st.session_state[f"pdfbytes_{retailer}"]
-        pdf_name = st.session_state.get(f"pdfname_{retailer}", f"{retailer}.pdf")
-        vendor_list_extended = st.session_state[f"vendors_{retailer}"]
+        rows.append({
+            "Page": i + 1,
+            "Vendor": final_vendor,
+            "Detected Vendor": vendor,
+            "Confidence %": confidence,
+            "Matched SKU/Model (first 15)": ", ".join(matched) if matched else ""
+        })
 
-        df_report = pd.DataFrame(rows)
-        st.subheader("Page → Vendor Report (with confidence)")
-        st.dataframe(df_report, use_container_width=True, hide_index=True)
+    # Store state
+    st.session_state[f"rows_{retailer}"] = rows
+    st.session_state[f"lookup_{retailer}"] = lookup
+    st.session_state[f"pdfbytes_{retailer}"] = pdf_bytes
+    st.session_state[f"pdfname_{retailer}"] = pdf_name
+    st.session_state[f"vendors_{retailer}"] = vendor_list_extended
 
-        page_vendor_rows = [{"PageIndex": r["Page"] - 1, "Vendor": r["Vendor"]} for r in rows]
-        vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
-        warehouse_pdf = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
-        zip_bytes = build_zip(vendor_pdfs, retailer, base_name=pdf_name, warehouse_print_pdf=warehouse_pdf)
+if process:
+    _process_pdf_and_store_state()
 
-        st.subheader("Downloads")
-        st.download_button(
-            "Download Vendor ZIP",
-            data=zip_bytes,
-            file_name=f"{re.sub(r'\\.pdf$', '', pdf_name, flags=re.IGNORECASE)}_VendorPdfs.zip",
-            mime="application/zip",
-        )
+if _ensure_state_loaded():
+    rows = st.session_state[f"rows_{retailer}"]
+    pdf_bytes = st.session_state[f"pdfbytes_{retailer}"]
+    pdf_name = st.session_state.get(f"pdfname_{retailer}", f"{retailer}.pdf")
+    vendor_list_extended = st.session_state[f"vendors_{retailer}"]
 
-        csv = df_report.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Report CSV",
-            data=csv,
-            file_name=f"{retailer.replace(' ', '')}_PageVendorReport.csv",
-            mime="text/csv",
-        )
+    df_report = pd.DataFrame(rows)
 
-        st.subheader("Summary")
-        counts = df_report["Vendor"].value_counts().reset_index()
-        counts.columns = ["Vendor", "Pages"]
-        st.dataframe(counts, use_container_width=True, hide_index=True)
+    st.subheader("Page → Vendor Report (with confidence)")
+    st.dataframe(df_report, use_container_width=True, hide_index=True)
 
-        st.divider()
-        st.subheader("Fix Pages That Need Review")
+    # Build vendor PDFs (from final Vendor column) + ZIP
+    page_vendor_rows = [{"PageIndex": r["Page"] - 1, "Vendor": r["Vendor"]} for r in rows]
+    vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
+    warehouse_pdf = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
+    zip_bytes = build_zip(vendor_pdfs, retailer, base_name=pdf_name, warehouse_print_pdf=warehouse_pdf)
 
-        needs_review_mask = df_report["Vendor"].isin(["REVIEW", "UNKNOWN", "MIXED/REVIEW"])
-        df_needs = df_report.loc[needs_review_mask, ["Page", "Vendor", "Detected Vendor", "Confidence %", "Matched SKU/Model (first 15)"]].copy()
+    st.subheader("Downloads")
+    zip_download_name = re.sub(r"\.pdf$", "", pdf_name, flags=re.IGNORECASE).strip() + "_VendorPdfs.zip"
+    st.download_button(
+        "Download Vendor ZIP",
+        data=zip_bytes,
+        file_name=zip_download_name,
+        mime="application/zip"
+    )
 
-        if df_needs.empty:
-            st.success("All pages were sorted to a vendor — nothing to review.")
-        else:
-            edited = st.data_editor(
-                df_needs,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                column_config={
-                    "Vendor": st.column_config.SelectboxColumn("Vendor (set correct one)", options=vendor_list_extended, required=True),
-                    "Page": st.column_config.NumberColumn("Page", disabled=True),
-                    "Detected Vendor": st.column_config.TextColumn("Detected Vendor", disabled=True),
-                    "Confidence %": st.column_config.NumberColumn("Confidence %", disabled=True),
-                    "Matched SKU/Model (first 15)": st.column_config.TextColumn("Matched SKU/Model (first 15)", disabled=True),
-                },
-                key=f"bulk_editor_{retailer}",
-            )
+    csv = df_report.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Report CSV",
+        data=csv,
+        file_name=f"{retailer.replace(' ', '')}_PageVendorReport.csv",
+        mime="text/csv"
+    )
 
-            if st.button("Apply bulk changes", type="secondary", key=f"apply_bulk_{retailer}"):
-                edited_map = {int(r["Page"]): r["Vendor"] for _, r in edited.iterrows()}
-                for r in rows:
-                    pg = int(r["Page"])
-                    if pg in edited_map:
-                        r["Vendor"] = edited_map[pg]
-                        r["Detected Vendor"] = r.get("Detected Vendor", edited_map[pg])
-                        r["Confidence %"] = max(int(r.get("Confidence %", 0) or 0), 99)
-                st.session_state[f"rows_{retailer}"] = rows
-                st.success("Applied bulk changes.")
-                st.rerun()
+    st.subheader("Summary")
+    counts = df_report["Vendor"].value_counts().reset_index()
+    counts.columns = ["Vendor", "Pages"]
+    st.dataframe(counts, use_container_width=True, hide_index=True)
 
-        st.divider()
-        st.subheader("Change Any Specific Page")
+    # -----------------------------
+    # Manual Override / Page Fixes
+    # -----------------------------
+    st.divider()
+    st.subheader("Fix Pages That Need Review")
 
-        sel_page = st.selectbox("Page number to change", df_report["Page"].tolist(), index=0, key=f"override_page_{retailer}")
-        current_row = next((r for r in rows if r["Page"] == sel_page), None)
-        if current_row is not None:
-            st.write(f"Matched: {current_row.get('Matched SKU/Model (first 15)', '')}")
-            new_vendor = st.selectbox(
-                "Change to vendor",
-                vendor_list_extended,
-                index=vendor_list_extended.index(current_row.get("Vendor", "REVIEW")) if current_row.get("Vendor", "REVIEW") in vendor_list_extended else 0,
-                key=f"override_vendor_{retailer}",
-            )
-            if st.button("Apply single change", type="secondary", key=f"apply_override_{retailer}"):
-                for r in rows:
-                    if r["Page"] == sel_page:
-                        r["Vendor"] = new_vendor
-                        r["Detected Vendor"] = r.get("Detected Vendor", new_vendor)
-                        r["Confidence %"] = max(int(r.get("Confidence %", 0) or 0), 99)
-                        break
-                st.session_state[f"rows_{retailer}"] = rows
-                st.success(f"Updated page {sel_page} to vendor: {new_vendor}")
-                st.rerun()
+    st.caption(
+        "This list only includes pages that were not confidently sorted (REVIEW / UNKNOWN / MIXED). "
+        "You can correct them in bulk below. After applying, the report and ZIP will update."
+    )
+
+    needs_review_mask = df_report["Vendor"].isin(["REVIEW", "UNKNOWN", "MIXED/REVIEW"])
+    df_needs = df_report.loc[needs_review_mask, ["Page", "Vendor", "Detected Vendor", "Confidence %", "Matched SKU/Model (first 15)"]].copy()
+
+    if df_needs.empty:
+        st.success("All pages were sorted to a vendor — nothing to review.")
     else:
-        st.info("Upload a PDF and click **Process PDF** to generate the report and vendor ZIP.")
+        st.write("Bulk corrections (edit the Vendor column):")
+
+        edited = st.data_editor(
+            df_needs,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Vendor": st.column_config.SelectboxColumn(
+                    "Vendor (set correct one)",
+                    options=vendor_list_extended,
+                    required=True,
+                ),
+                "Page": st.column_config.NumberColumn("Page", disabled=True),
+                "Detected Vendor": st.column_config.TextColumn("Detected Vendor", disabled=True),
+                "Confidence %": st.column_config.NumberColumn("Confidence %", disabled=True),
+                "Matched SKU/Model (first 15)": st.column_config.TextColumn("Matched SKU/Model (first 15)", disabled=True),
+            },
+            key=f"bulk_editor_{retailer}"
+        )
+
+        apply_bulk = st.button("Apply bulk changes", type="secondary", key=f"apply_bulk_{retailer}")
+
+        if apply_bulk:
+            # Apply edits back to rows
+            edited_map = {int(r["Page"]): r["Vendor"] for _, r in edited.iterrows()}
+            for r in rows:
+                pg = int(r["Page"])
+                if pg in edited_map:
+                    r["Vendor"] = edited_map[pg]
+                    r["Detected Vendor"] = r.get("Detected Vendor", edited_map[pg])
+                    r["Confidence %"] = max(int(r.get("Confidence %", 0) or 0), 99)
+
+            st.session_state[f"rows_{retailer}"] = rows
+            st.success("Applied bulk changes.")
+            st.rerun()
+
+    # -----------------------------
+    # Optional: single page override
+    # -----------------------------
+    st.divider()
+    st.subheader("Change Any Specific Page")
+
+    st.caption("Use this if you want to change a page that was already assigned, or if you missed something above.")
+
+    page_numbers_all = df_report["Page"].tolist()
+    sel_page = st.selectbox("Page number to change", page_numbers_all, index=0, key=f"override_page_{retailer}")
+
+    current_row = next((r for r in rows if r["Page"] == sel_page), None)
+    if current_row is None:
+        st.warning("Could not locate that page in the current run.")
+    else:
+        c1, c2, c3 = st.columns([1.2, 1.2, 2])
+
+        with c1:
+            st.text_input("Currently assigned vendor", value=str(current_row.get("Vendor", "")), disabled=True)
+        with c2:
+            st.text_input("Confidence %", value=str(current_row.get("Confidence %", "")), disabled=True)
+        with c3:
+            st.text_input("Matched SKU/Model (first 15)", value=str(current_row.get("Matched SKU/Model (first 15)", "")), disabled=True)
+
+        new_vendor = st.selectbox(
+            "Change to vendor",
+            vendor_list_extended,
+            index=vendor_list_extended.index(current_row.get("Vendor", "REVIEW")) if current_row.get("Vendor", "REVIEW") in vendor_list_extended else 0,
+            key=f"override_vendor_{retailer}"
+        )
+
+        apply_change = st.button("Apply single change", type="secondary", key=f"apply_override_{retailer}")
+
+        if apply_change:
+            for r in rows:
+                if r["Page"] == sel_page:
+                    r["Vendor"] = new_vendor
+                    r["Detected Vendor"] = r.get("Detected Vendor", new_vendor)
+                    r["Confidence %"] = max(int(r.get("Confidence %", 0) or 0), 99)
+                    break
+
+            st.session_state[f"rows_{retailer}"] = rows
+            st.success(f"Updated page {sel_page} to vendor: {new_vendor}")
+            st.rerun()
+
+else:
+    st.info("Upload a PDF and click **Process PDF** to generate the report and vendor ZIP.")
+CROP_CONFIG_DEFAULTS = {
+    "Home Depot": {"x0": 0.02, "x1": 0.14, "y0": 0.26, "y1": 0.54},
+    "Lowe's": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
+    "Tractor Supply": {"x0": 0.14, "x1": 0.30, "y0": 0.20, "y1": 0.55},
+}
+
