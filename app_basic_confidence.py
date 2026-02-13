@@ -84,6 +84,24 @@ def extract_text_by_page(pdf_bytes: bytes) -> list[str]:
     return out
 
 
+
+def is_sos_tag_page(text: str) -> bool:
+    """
+    Heuristic detector for Lowe's SOS (Ship-to-Store) tag/label pages.
+    These pages typically follow the order page and should inherit the prior page's vendor.
+    """
+    t_raw = (text or "").upper()
+    # Common signals. Adjust/add as you encounter variants in real PDFs.
+    keywords = [
+        "SOS",               # SOS tag
+        "SHIP TO STORE",
+        "STORE PICKUP",
+        "PICK UP IN STORE",
+        "S2S",               # sometimes used shorthand
+        "SPECIAL ORDER",     # sometimes appears near SOS wording
+    ]
+    return any(k in t_raw for k in keywords)
+
 def match_vendor(text: str, lookup: dict) -> tuple[str, list[str], int]:
     """
     Find SKUs/Models present in page text.
@@ -164,12 +182,15 @@ def build_zip(vendor_pdfs: dict[str, bytes], retailer: str) -> bytes:
 # -----------------------------
 # UI
 # -----------------------------
+# UI
+# -----------------------------
 st.set_page_config(page_title="Retail Order Splitter (Basic)", layout="wide")
 st.title("Retail Order Splitter (Basic)")
 
 st.caption(
     "Upload a PDF. The app scans each page for SKUs/Models from the vendor map, assigns a vendor, "
-    "then builds a ZIP with one PDF per vendor containing *all* pages for that vendor."
+    "then builds a ZIP with one PDF per vendor containing *all* pages for that vendor. "
+    "Lowe's SOS tag pages inherit the vendor from the prior page."
 )
 
 retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], index=1)
@@ -190,9 +211,27 @@ with st.expander("Vendor Map (built in by default)"):
 
 pdf_file = st.file_uploader(f"Upload {retailer} PDF", type=["pdf"], key=f"pdf_{retailer}")
 
-process = st.button("Process PDF", type="primary", disabled=(pdf_file is None))
+colA, colB = st.columns([1, 1])
+with colA:
+    process = st.button("Process PDF", type="primary", disabled=(pdf_file is None))
+with colB:
+    clear = st.button("Clear Results", disabled=(f"rows_{retailer}" not in st.session_state))
 
-if process and pdf_file is not None:
+if clear:
+    for k in [f"rows_{retailer}", f"lookup_{retailer}", f"pdfbytes_{retailer}", f"vendors_{retailer}"]:
+        if k in st.session_state:
+            del st.session_state[k]
+    st.rerun()
+
+def _ensure_state_loaded():
+    if f"rows_{retailer}" not in st.session_state:
+        return False
+    return True
+
+def _process_pdf_and_store_state():
+    if pdf_file is None:
+        return
+
     pdf_bytes = pdf_file.read()
 
     # Load map and lookup
@@ -203,12 +242,35 @@ if process and pdf_file is not None:
         st.error(f"Vendor map error: {e}")
         st.stop()
 
-    # Extract page texts
+    # Vendor list (from map) for dropdowns + special buckets
+    vendor_list = sorted(set(lookup.values()))
+    vendor_list_extended = vendor_list + ["REVIEW", "UNKNOWN", "MIXED/REVIEW"]
+
     with st.spinner("Reading PDF and matching vendors..."):
         texts = extract_text_by_page(pdf_bytes)
 
     rows = []
     for i, text in enumerate(texts):
+        # Lowe's SOS tag pages: inherit vendor from the prior page (the order page)
+        if retailer == "Lowe's" and is_sos_tag_page(text):
+            if rows:
+                final_vendor = rows[-1]["Vendor"]
+                detected_vendor = rows[-1].get("Detected Vendor", final_vendor)
+                confidence = max(int(rows[-1].get("Confidence %", 0)), 80)
+            else:
+                final_vendor = "REVIEW"
+                detected_vendor = "SOS (no prior page)"
+                confidence = 50
+
+            rows.append({
+                "Page": i + 1,
+                "Vendor": final_vendor,
+                "Detected Vendor": detected_vendor,
+                "Confidence %": confidence,
+                "Matched SKU/Model (first 15)": "",
+            })
+            continue
+
         vendor, matched, confidence = match_vendor(text, lookup)
 
         # Apply threshold: low-confidence pages get routed to REVIEW
@@ -224,11 +286,26 @@ if process and pdf_file is not None:
             "Matched SKU/Model (first 15)": ", ".join(matched) if matched else ""
         })
 
+    # Store state
+    st.session_state[f"rows_{retailer}"] = rows
+    st.session_state[f"lookup_{retailer}"] = lookup
+    st.session_state[f"pdfbytes_{retailer}"] = pdf_bytes
+    st.session_state[f"vendors_{retailer}"] = vendor_list_extended
+
+if process:
+    _process_pdf_and_store_state()
+
+if _ensure_state_loaded():
+    rows = st.session_state[f"rows_{retailer}"]
+    pdf_bytes = st.session_state[f"pdfbytes_{retailer}"]
+    vendor_list_extended = st.session_state[f"vendors_{retailer}"]
+
     df_report = pd.DataFrame(rows)
+
     st.subheader("Page → Vendor Report (with confidence)")
     st.dataframe(df_report, use_container_width=True, hide_index=True)
 
-    # Build vendor PDFs (from report)
+    # Build vendor PDFs (from final Vendor column) + ZIP
     page_vendor_rows = [{"PageIndex": r["Page"] - 1, "Vendor": r["Vendor"]} for r in rows]
     vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
     zip_bytes = build_zip(vendor_pdfs, retailer)
@@ -241,7 +318,6 @@ if process and pdf_file is not None:
         mime="application/zip"
     )
 
-    # Optional: download report
     csv = df_report.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download Report CSV",
@@ -250,8 +326,61 @@ if process and pdf_file is not None:
         mime="text/csv"
     )
 
-    # Quick stats
     st.subheader("Summary")
     counts = df_report["Vendor"].value_counts().reset_index()
     counts.columns = ["Vendor", "Pages"]
     st.dataframe(counts, use_container_width=True, hide_index=True)
+
+    # -----------------------------
+    # Manual Override / Page Fixes
+    # -----------------------------
+    st.divider()
+    st.subheader("Fix Page Assignments")
+
+    st.caption(
+        "If a page was assigned to the wrong vendor (or routed to REVIEW due to low confidence), "
+        "you can override it here. After applying, the report and ZIP will update immediately."
+    )
+
+    page_numbers = df_report["Page"].tolist()
+    sel_page = st.selectbox("Page number to change", page_numbers, index=0, key=f"override_page_{retailer}")
+
+    # Pull current row info
+    current_row = next((r for r in rows if r["Page"] == sel_page), None)
+    if current_row is None:
+        st.warning("Could not locate that page in the current run.")
+    else:
+        c1, c2, c3 = st.columns([1.2, 1.2, 2])
+
+        with c1:
+            st.text_input("Currently assigned vendor", value=str(current_row.get("Vendor", "")), disabled=True)
+        with c2:
+            st.text_input("Confidence %", value=str(current_row.get("Confidence %", "")), disabled=True)
+        with c3:
+            st.text_input("Matched SKU/Model (first 15)", value=str(current_row.get("Matched SKU/Model (first 15)", "")), disabled=True)
+
+        new_vendor = st.selectbox(
+            "Change to vendor",
+            vendor_list_extended,
+            index=vendor_list_extended.index(current_row.get("Vendor", "REVIEW")) if current_row.get("Vendor", "REVIEW") in vendor_list_extended else 0,
+            key=f"override_vendor_{retailer}"
+        )
+
+        apply_change = st.button("Apply change", type="secondary", key=f"apply_override_{retailer}")
+
+        if apply_change:
+            # Update row
+            for r in rows:
+                if r["Page"] == sel_page:
+                    r["Vendor"] = new_vendor
+                    # Keep original detected vendor for transparency; if absent, set it
+                    r["Detected Vendor"] = r.get("Detected Vendor", new_vendor)
+                    # If user overrides, set confidence high so it doesn't get re-flagged by threshold later
+                    r["Confidence %"] = max(int(r.get("Confidence %", 0) or 0), 99)
+                    break
+
+            st.session_state[f"rows_{retailer}"] = rows
+            st.success(f"Updated page {sel_page} to vendor: {new_vendor}")
+            st.rerun()
+else:
+    st.info("Upload a PDF and click **Process PDF** to generate the report and vendor ZIP.")
