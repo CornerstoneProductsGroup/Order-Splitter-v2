@@ -37,15 +37,6 @@ MAP_KEY_COL = {
 }
 MAP_VENDOR_COL = "Vendor"
 
-# Text-extraction crop regions (fractions of page height).
-# Coordinates in PDF space are from the bottom (0.0) to top (1.0).
-# These defaults remove header/footer areas where order/customer numbers often appear.
-CROP_CONFIG = {
-    "Home Depot": {"y0": 0.00, "y1": 0.70},      # bottom 70% (below header)
-    "Lowe's": {"y0": 0.12, "y1": 0.90},          # middle 78% (skip header/footer)
-    "Tractor Supply": {"y0": 0.10, "y1": 0.90},  # middle 80%
-}
-
 
 # -----------------------------
 # Helpers
@@ -94,58 +85,14 @@ def build_lookup(df: pd.DataFrame, retailer: str) -> dict:
     return lookup
 
 
-def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str) -> list[dict]:
-    """
-    Return a list of dicts per page:
-      {"full": <full page text>, "region": <cropped region text>}
-    Region cropping is used for vendor matching to avoid false positives from headers/footers.
-    """
-    from copy import copy
-    from pypdf.generic import RectangleObject
-
-    cfg = CROP_CONFIG.get(retailer, {"y0": 0.0, "y1": 1.0})
-    y0_frac = float(cfg.get("y0", 0.0))
-    y1_frac = float(cfg.get("y1", 1.0))
-
+def extract_text_by_page(pdf_bytes: bytes) -> list[str]:
     reader = PdfReader(BytesIO(pdf_bytes))
     out = []
-
     for page in reader.pages:
-        # Full text (used for SOS detection and general fallback)
         try:
-            full_text = page.extract_text() or ""
+            out.append(page.extract_text() or "")
         except Exception:
-            full_text = ""
-
-        # Region text (used for SKU/Model matching)
-        try:
-            # Copy the page object so we don't mutate the original
-            p2 = copy(page)
-
-            # Determine page bounds
-            mb = page.mediabox
-            x0 = float(mb.left)
-            x1 = float(mb.right)
-            h = float(mb.top) - float(mb.bottom)
-
-            ry0 = float(mb.bottom) + y0_frac * h
-            ry1 = float(mb.bottom) + y1_frac * h
-
-            # Clamp
-            ry0 = max(float(mb.bottom), min(ry0, float(mb.top)))
-            ry1 = max(float(mb.bottom), min(ry1, float(mb.top)))
-            if ry1 <= ry0:
-                ry0, ry1 = float(mb.bottom), float(mb.top)
-
-            p2.cropbox = RectangleObject([x0, ry0, x1, ry1])
-
-            region_text = p2.extract_text() or ""
-        except Exception:
-            # Fallback if crop-based extraction fails
-            region_text = full_text
-
-        out.append({"full": full_text, "region": region_text})
-
+            out.append("")
     return out
 
 def extract_search_region(text: str, retailer: str) -> str:
@@ -218,8 +165,9 @@ def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str]
       - MIXED/REVIEW: 25%
       - Single-vendor pages: confidence rises with number of SKU/Model hits
     """
-        # Normalize the cropped region text (header/footer removed)
-    t = normalize_key(text)
+    # Normalize only the region we care about (to avoid matching order/customer numbers)
+    region = extract_search_region(text, retailer)
+    t = normalize_key(region)
 
     matched = []
     vendors = set()
@@ -405,15 +353,12 @@ def _process_pdf_and_store_state():
     vendor_list_extended = vendor_list + ["REVIEW", "UNKNOWN", "MIXED/REVIEW"]
 
     with st.spinner("Reading PDF and matching vendors..."):
-        pages = extract_text_by_page_with_regions(pdf_bytes, retailer)
+        texts = extract_text_by_page(pdf_bytes)
 
     rows = []
-    for i, page_obj in enumerate(pages):
-        full_text = page_obj.get("full", "")
-        region_text = page_obj.get("region", full_text)
-
+    for i, text in enumerate(texts):
         # Lowe's SOS tag pages: inherit vendor from the prior page (the order page)
-        if retailer == "Lowe's" and is_sos_tag_page(full_text):
+        if retailer == "Lowe's" and is_sos_tag_page(text):
             if rows:
                 final_vendor = rows[-1]["Vendor"]
                 detected_vendor = rows[-1].get("Detected Vendor", final_vendor)
@@ -432,7 +377,7 @@ def _process_pdf_and_store_state():
             })
             continue
 
-        vendor, matched, confidence = match_vendor(region_text, lookup, retailer)
+        vendor, matched, confidence = match_vendor(text, lookup, retailer)
 
         # Apply threshold: low-confidence pages get routed to REVIEW
         final_vendor = vendor
