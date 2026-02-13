@@ -387,6 +387,7 @@ def _process_pdf_and_store_state():
         df_map = load_vendor_map(retailer, uploaded_file=map_upload)
         lookup = build_lookup(df_map, retailer)
             vendor_email_map = extract_vendor_email_map(df_map)
+            vendor_email_map = extract_vendor_email_map(df_map)
     except Exception as e:
         st.error(f"Vendor map error: {e}")
         st.stop()
