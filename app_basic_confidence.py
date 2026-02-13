@@ -95,6 +95,50 @@ def extract_text_by_page(pdf_bytes: bytes) -> list[str]:
             out.append("")
     return out
 
+def extract_search_region(text: str, retailer: str) -> str:
+    """
+    Limit the text region used for SKU/Model matching to reduce false positives.
+
+    Home Depot: Only scan the "items table" area (below the 'Model Number' header),
+    stopping before the footer (e.g., 'Page:' / thank-you line).
+    Other retailers: scan full page text.
+    """
+    if retailer != "Home Depot":
+        return text or ""
+
+    if not text:
+        return ""
+
+    lines = [ln.strip() for ln in (text.splitlines() or [])]
+
+    # Find the table header line
+    header_idx = None
+    for i, ln in enumerate(lines):
+        up = ln.upper()
+        if "MODEL NUMBER" in up and ("INTERNET NUMBER" in up or "ITEM DESCRIPTION" in up):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        # Fallback: scan entire page if header not found
+        return text
+
+    # Start scanning just below the header
+    start = header_idx + 1
+
+    # Stop at footer markers if present
+    end = len(lines)
+    for j in range(start, len(lines)):
+        up = lines[j].upper()
+        if up.startswith("PAGE:") or "THANK YOU FOR SHOPPING AT THE HOME DEPOT" in up:
+            end = j
+            break
+
+    region = "
+".join(lines[start:end]).strip()
+    return region if region else text
+
+
 
 
 def is_sos_tag_page(text: str) -> bool:
@@ -114,7 +158,7 @@ def is_sos_tag_page(text: str) -> bool:
     ]
     return any(k in t_raw for k in keywords)
 
-def match_vendor(text: str, lookup: dict) -> tuple[str, list[str], int]:
+def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str], int]:
     """
     Find SKUs/Models present in page text.
     Returns:
@@ -125,8 +169,9 @@ def match_vendor(text: str, lookup: dict) -> tuple[str, list[str], int]:
       - MIXED/REVIEW: 25%
       - Single-vendor pages: confidence rises with number of SKU/Model hits
     """
-    # normalize page text similarly
-    t = normalize_key(text)
+    # Normalize only the region we care about (to avoid matching order/customer numbers)
+    region = extract_search_region(text, retailer)
+    t = normalize_key(region)
 
     matched = []
     vendors = set()
@@ -340,7 +385,7 @@ def _process_pdf_and_store_state():
             })
             continue
 
-        vendor, matched, confidence = match_vendor(text, lookup)
+        vendor, matched, confidence = match_vendor(text, lookup, retailer)
 
         # Apply threshold: low-confidence pages get routed to REVIEW
         final_vendor = vendor
