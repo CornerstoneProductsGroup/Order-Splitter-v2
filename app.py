@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 
 from pypdf import PdfReader, PdfWriter
-import smtplib, ssl
+import smtplib, ssl, re
 from email.message import EmailMessage
 
 
@@ -178,6 +178,7 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[st
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
 
     vendor_pdfs = {}
+        st.session_state['vendor_pdfs'] = vendor_pdfs
     for vendor, idxs in pages_by_vendor.items():
         writer = PdfWriter()
         for i in idxs:
@@ -429,28 +430,7 @@ if _ensure_state_loaded():
     # Manual Override / Page Fixes
     # -----------------------------
     st.divider()
-    
-        with st.expander("Auto Email (simple)", expanded=False):
-            smtp_host = st.text_input("SMTP host","smtp.gmail.com")
-            smtp_port = st.number_input("SMTP port", value=587)
-            use_tls = st.checkbox("Use TLS", True)
-            smtp_user = st.text_input("SMTP user")
-            smtp_pwd = st.text_input("SMTP password", type="password")
-            sender = st.text_input("From email", smtp_user)
-            vendors = [v for v in vendor_pdfs.keys() if v not in ("REVIEW","UNKNOWN","MIXED/REVIEW")]
-            if vendors:
-                vsel = st.selectbox("Vendor", vendors)
-                to = st.text_input("To email(s)")
-                if st.button("Send email"):
-                    try:
-                        tos=[x.strip() for x in re.split("[,; ]+",to) if x.strip()]
-                        send_email_simple(smtp_host,smtp_port,smtp_user,smtp_pwd,use_tls,sender,tos,
-                                          f"{retailer} Orders - {vsel}","Attached orders",
-                                          vendor_pdfs[vsel], f"{vsel}.pdf")
-                        st.success("Email sent")
-                    except Exception as e:
-                        st.error(str(e))
-st.subheader("Fix / Override Page Assignments")
+    st.subheader("Fix / Override Page Assignments")
 
     st.caption(
         "This section is always available after processing so you can override any page if needed. "
@@ -591,3 +571,37 @@ st.subheader("Fix / Override Page Assignments")
 
 else:
     st.info("Upload a PDF and click **Process PDF** to generate the report and vendor ZIP.")
+
+
+
+with tab_email:
+    st.header("Auto Email Vendors")
+    st.info("Upload & process a PDF first so vendor files exist.")
+
+    smtp_host = st.text_input("SMTP host","smtp.gmail.com")
+    smtp_port = st.number_input("SMTP port", value=587)
+    use_tls = st.checkbox("Use TLS", True)
+    smtp_user = st.text_input("SMTP user")
+    smtp_pwd = st.text_input("SMTP password", type="password")
+    sender = st.text_input("From email", smtp_user)
+
+    if "vendor_pdfs" in st.session_state:
+        vendor_pdfs = st.session_state["vendor_pdfs"]
+        vendors = [v for v in vendor_pdfs.keys() if v not in ("REVIEW","UNKNOWN","MIXED/REVIEW")]
+        if vendors:
+            vsel = st.selectbox("Vendor", vendors)
+            to = st.text_input("Recipient email(s)")
+
+            if st.button("Send email"):
+                try:
+                    tos=[x.strip() for x in re.split("[,; ]+",to) if x.strip()]
+                    send_email_simple(smtp_host,smtp_port,smtp_user,smtp_pwd,use_tls,sender,tos,
+                                      f"Orders - {vsel}","Attached orders",
+                                      vendor_pdfs[vsel], f"{vsel}.pdf")
+                    st.success("Email sent")
+                except Exception as e:
+                    st.error(str(e))
+        else:
+            st.warning("No vendor PDFs available yet.")
+    else:
+        st.warning("Process a PDF first.")
