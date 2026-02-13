@@ -9,6 +9,7 @@ from collections import defaultdict
 
 import fitz  # PyMuPDF
 from PIL import Image, ImageDraw
+from streamlit_drawable_canvas import st_canvas
 
 from pypdf import PdfReader, PdfWriter
 
@@ -45,12 +46,12 @@ WAREHOUSE_VENDORS = [
 # Persisted crop config file (optional). Best persistence on Streamlit Cloud: commit this file to repo.
 CROP_CONFIG_PATH = "crop_config.json"
 
-# Default scan regions per retailer (fractions of page height; 0.0=bottom, 1.0=top)
-# These should be tuned using the Scan Area Tuning tab.
+# Default scan rectangles per retailer (fractions of page width/height; 0..1).
+# Fractions use PDF coordinates: x from left, y from bottom.
 CROP_CONFIG_DEFAULTS = {
-    "Home Depot": {"y0": 0.30, "y1": 0.75},
-    "Lowe's": {"y0": 0.35, "y1": 0.80},
-    "Tractor Supply": {"y0": 0.30, "y1": 0.85},
+    "Home Depot": {"x0": 0.05, "x1": 0.95, "y0": 0.30, "y1": 0.75},
+    "Lowe's": {"x0": 0.05, "x1": 0.95, "y0": 0.35, "y1": 0.80},
+    "Tractor Supply": {"x0": 0.05, "x1": 0.95, "y0": 0.30, "y1": 0.85},
 }
 
 
@@ -62,27 +63,17 @@ def normalize_key(x: str) -> str:
     if x is None:
         return ""
     s = str(x).strip().upper()
-    # remove spaces and common separators
     s = re.sub(r"[\s\-_]", "", s)
     return s
 
 
 def load_vendor_map(retailer: str, uploaded_file=None) -> pd.DataFrame:
-    """
-    Load a vendor map for the retailer.
-    Priority:
-      1) Uploaded file (if provided)
-      2) Packaged default file in repo
-    """
     if uploaded_file is not None:
         return pd.read_excel(uploaded_file)
-
-    default_path = DEFAULT_MAPS[retailer]
-    return pd.read_excel(default_path)
+    return pd.read_excel(DEFAULT_MAPS[retailer])
 
 
 def build_lookup(df: pd.DataFrame, retailer: str) -> dict:
-    """Build dict: normalized SKU/Model -> Vendor"""
     key_col = MAP_KEY_COL[retailer]
     if key_col not in df.columns or MAP_VENDOR_COL not in df.columns:
         raise ValueError(
@@ -100,31 +91,18 @@ def build_lookup(df: pd.DataFrame, retailer: str) -> dict:
 
 
 def is_sos_tag_page(text: str) -> bool:
-    """
-    Heuristic detector for Lowe's SOS (Ship-to-Store) tag/label pages.
-    These pages typically follow the order page and should inherit the prior page's vendor.
-    """
-    t_raw = (text or "").upper()
-    keywords = [
-        "SOS",
-        "SHIP TO STORE",
-        "STORE PICKUP",
-        "PICK UP IN STORE",
-        "S2S",
-        "SPECIAL ORDER",
-    ]
-    return any(k in t_raw for k in keywords)
+    t = (text or "").upper()
+    keywords = ["SOS", "SHIP TO STORE", "STORE PICKUP", "PICK UP IN STORE", "S2S", "SPECIAL ORDER"]
+    return any(k in t for k in keywords)
 
 
 def load_crop_config() -> dict:
-    """Load persisted crop config if available, else return defaults."""
     try:
         import os
         if os.path.exists(CROP_CONFIG_PATH):
             with open(CROP_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                # fill missing retailers with defaults
                 for r, d in CROP_CONFIG_DEFAULTS.items():
                     data.setdefault(r, d)
                 return data
@@ -134,10 +112,6 @@ def load_crop_config() -> dict:
 
 
 def save_crop_config(cfg: dict) -> bool:
-    """
-    Persist crop config to a json file.
-    Note: on Streamlit Community Cloud this may reset after sleep/restart unless committed to repo.
-    """
     try:
         with open(CROP_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
@@ -146,35 +120,46 @@ def save_crop_config(cfg: dict) -> bool:
         return False
 
 
-def render_scan_area_overlay(pdf_bytes: bytes, retailer: str, page_index: int, y0_frac: float, y1_frac: float, zoom: float = 2.0) -> bytes:
+def pdf_page_to_png_bytes(pdf_bytes: bytes, page_index: int, zoom: float = 2.0) -> tuple[bytes, int, int]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_index = max(0, min(page_index, doc.page_count - 1))
+    page = doc.load_page(page_index)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    buff = io.BytesIO()
+    img.save(buff, format="PNG")
+    return buff.getvalue(), pix.width, pix.height
+
+
+def render_scan_area_overlay(pdf_bytes: bytes, page_index: int, rect_cfg: dict, zoom: float = 2.0) -> bytes:
     """
-    Render a PDF page to PNG and draw the scan area rectangle.
-    Fractions are in PDF coordinates (0=bottom, 1=top).
-    Returns PNG bytes.
+    Draw the configured scan rectangle on the rendered page.
+    rect_cfg uses PDF fractions: x0,x1 (left->right), y0,y1 (bottom->top)
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_index = max(0, min(page_index, doc.page_count - 1))
     page = doc.load_page(page_index)
 
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     draw = ImageDraw.Draw(img)
 
     h = page.rect.height
     w = page.rect.width
 
-    # Convert bottom-based fractions to fitz top-left y coordinates
-    top_y = (1 - y1_frac) * h
-    bot_y = (1 - y0_frac) * h
+    x0f = float(rect_cfg.get("x0", 0.0)); x1f = float(rect_cfg.get("x1", 1.0))
+    y0f = float(rect_cfg.get("y0", 0.0)); y1f = float(rect_cfg.get("y1", 1.0))
+    if x1f < x0f: x0f, x1f = x1f, x0f
+    if y1f < y0f: y0f, y1f = y1f, y0f
 
-    # Scale to rendered image space
-    top_y *= zoom
-    bot_y *= zoom
-    x0 = 0
-    x1 = w * zoom
+    # Convert to fitz top-left coords (points), then scale
+    left = x0f * w
+    right = x1f * w
+    top = (1 - y1f) * h
+    bottom = (1 - y0f) * h
 
-    draw.rectangle([x0, top_y, x1, bot_y], outline="red", width=6)
+    left *= zoom; right *= zoom; top *= zoom; bottom *= zoom
+    draw.rectangle([left, top, right, bottom], outline="red", width=6)
 
     buff = io.BytesIO()
     img.save(buff, format="PNG")
@@ -183,14 +168,15 @@ def render_scan_area_overlay(pdf_bytes: bytes, retailer: str, page_index: int, y
 
 def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg: dict) -> list[dict]:
     """
-    Return list per page:
-      {"full": <full page text>, "region": <region text>}
-    Region text is extracted by filtering text by Y-position (page geometry),
-    which is more reliable than cropbox for text extraction.
+    Extract:
+      - full text (for SOS detection, etc.)
+      - region text filtered by x/y position (geometry)
     """
-    cfg = crop_cfg.get(retailer, {"y0": 0.0, "y1": 1.0})
-    y0_frac = float(cfg.get("y0", 0.0))
-    y1_frac = float(cfg.get("y1", 1.0))
+    cfg = crop_cfg.get(retailer, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
+    x0f = float(cfg.get("x0", 0.0)); x1f = float(cfg.get("x1", 1.0))
+    y0f = float(cfg.get("y0", 0.0)); y1f = float(cfg.get("y1", 1.0))
+    if x1f < x0f: x0f, x1f = x1f, x0f
+    if y1f < y0f: y0f, y1f = y1f, y0f
 
     reader = PdfReader(BytesIO(pdf_bytes))
     out = []
@@ -203,22 +189,27 @@ def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg:
 
         try:
             mb = page.mediabox
+            left = float(mb.left)
+            right = float(mb.right)
             bottom = float(mb.bottom)
             top = float(mb.top)
+            w = right - left
             h = top - bottom
-            y0 = bottom + y0_frac * h
-            y1 = bottom + y1_frac * h
-            if y1 < y0:
-                y0, y1 = y1, y0
+
+            x0 = left + x0f * w
+            x1 = left + x1f * w
+            y0 = bottom + y0f * h
+            y1 = bottom + y1f * h
 
             chunks = []
 
             def visitor_text(text, cm, tm, font_dict, font_size):
                 try:
+                    x = float(tm[4])
                     y = float(tm[5])
                 except Exception:
                     return
-                if y0 <= y <= y1:
+                if x0 <= x <= x1 and y0 <= y <= y1:
                     chunks.append(text)
 
             page.extract_text(visitor_text=visitor_text)
@@ -234,13 +225,7 @@ def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg:
 
 
 def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str], int]:
-    """
-    Find SKUs/Models present in (region) page text.
-    Returns:
-      (vendor, matched_keys, confidence_percent)
-    """
     t = normalize_key(text)
-
     matched = []
     vendors = set()
 
@@ -251,7 +236,6 @@ def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str]
 
     if not vendors:
         return "UNKNOWN", [], 0
-
     if len(vendors) > 1:
         return "MIXED/REVIEW", matched[:15], 25
 
@@ -273,9 +257,7 @@ def match_vendor(text: str, lookup: dict, retailer: str) -> tuple[str, list[str]
 
 
 def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[str, bytes]:
-    """Rebuild each vendor PDF from the original PDF using the page->vendor assignments."""
     reader = PdfReader(BytesIO(pdf_bytes))
-
     pages_by_vendor = defaultdict(list)
     for r in page_vendor_rows:
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
@@ -288,14 +270,11 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[st
         buff = BytesIO()
         writer.write(buff)
         vendor_pdfs[vendor] = buff.getvalue()
-
     return vendor_pdfs
 
 
 def build_warehouse_print_pdf(pdf_bytes: bytes, page_vendor_rows: list[dict], vendors: list[str]) -> bytes | None:
-    """Build a single PDF concatenating pages for a set of vendors, ordered alphabetically by vendor."""
     reader = PdfReader(BytesIO(pdf_bytes))
-
     pages_by_vendor = defaultdict(list)
     for r in page_vendor_rows:
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
@@ -314,13 +293,7 @@ def build_warehouse_print_pdf(pdf_bytes: bytes, page_vendor_rows: list[dict], ve
     return buff.getvalue()
 
 
-def build_zip(
-    vendor_pdfs: dict[str, bytes],
-    retailer: str,
-    base_name: str,
-    warehouse_print_pdf: bytes | None = None,
-) -> bytes:
-    """Build ZIP with vendor PDFs named from uploaded PDF base name; include optional warehouse print PDF."""
+def build_zip(vendor_pdfs: dict[str, bytes], retailer: str, base_name: str, warehouse_print_pdf: bytes | None = None) -> bytes:
     buff = BytesIO()
     base = re.sub(r"\.pdf$", "", base_name, flags=re.IGNORECASE).strip()
     base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or retailer.replace(" ", "")
@@ -328,7 +301,6 @@ def build_zip(
     with zipfile.ZipFile(buff, "w", compression=zipfile.ZIP_DEFLATED) as z:
         if warehouse_print_pdf is not None:
             z.writestr(f"{base} - WAREHOUSE PRINT.pdf", warehouse_print_pdf)
-
         for vendor, pdf_data in vendor_pdfs.items():
             safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
             z.writestr(f"{base} - {safe_vendor}.pdf", pdf_data)
@@ -350,91 +322,118 @@ tab_splitter, tab_tuning = st.tabs(["Order Splitter", "Scan Area Tuning"])
 with tab_tuning:
     st.subheader("Scan Area Tuning")
     st.caption(
-        "Adjust the scan box used for SKU/Model matching (per retailer). "
-        "Upload a PDF, then click **Show scan area** to preview the red box overlay. "
-        "These values are fractions of page height (0=bottom, 1=top)."
+        "Drag a rectangle over the model/SKU area. Then click **Use drawn box** to update the scan area. "
+        "You can then save/download the config."
     )
 
     t_retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], index=1, key="tuning_retailer")
     crop_cfg = st.session_state.get("crop_cfg", load_crop_config())
-    cur = crop_cfg.get(t_retailer, CROP_CONFIG_DEFAULTS.get(t_retailer, {"y0": 0.0, "y1": 1.0}))
+    cur = crop_cfg.get(t_retailer, CROP_CONFIG_DEFAULTS.get(t_retailer, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0}))
 
-    y0 = st.slider("Bottom (y0) fraction", 0.0, 1.0, float(cur.get("y0", 0.0)), 0.01, key="tuning_y0")
-    y1 = st.slider("Top (y1) fraction", 0.0, 1.0, float(cur.get("y1", 1.0)), 0.01, key="tuning_y1")
-
-    pdf_preview = st.file_uploader("Upload a PDF to preview scan area", type=["pdf"], key="tuning_pdf")
+    pdf_preview = st.file_uploader("Upload a PDF to preview", type=["pdf"], key="tuning_pdf")
     page_preview = st.number_input("Preview page number", min_value=1, value=1, step=1, key="tuning_page")
 
-    # Update in-session config live
-    yy0, yy1 = float(y0), float(y1)
-    if yy1 < yy0:
-        yy0, yy1 = yy1, yy0
-        st.warning("You set y1 below y0 — swapping internally for preview and saving.")
+    if pdf_preview is None:
+        st.info("Upload a PDF to enable the draggable box preview.")
+    else:
+        pdf_bytes_preview = pdf_preview.getvalue()
+        png_bytes, img_w, img_h = pdf_page_to_png_bytes(pdf_bytes_preview, int(page_preview) - 1, zoom=2.0)
 
-    crop_cfg[t_retailer] = {"y0": yy0, "y1": yy1}
-    st.session_state["crop_cfg"] = crop_cfg
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        show_box = st.button("Show scan area", key="tuning_show")
-    with c2:
-        save_defaults = st.button("Save as default", key="tuning_save")
-    with c3:
-        st.download_button(
-            "Download config JSON",
-            data=json.dumps(crop_cfg, indent=2).encode("utf-8"),
-            file_name="crop_config.json",
-            mime="application/json",
-            key="tuning_dl",
+        st.write("Draw a rectangle on the image (click + drag).")
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.15)",
+            stroke_width=3,
+            stroke_color="red",
+            background_image=Image.open(io.BytesIO(png_bytes)),
+            update_streamlit=True,
+            height=img_h,
+            width=img_w,
+            drawing_mode="rect",
+            key="canvas",
         )
 
-    cfg_upload = st.file_uploader("Upload config JSON (optional)", type=["json"], key="tuning_cfg_up")
-    if cfg_upload is not None:
-        try:
-            uploaded_cfg = json.load(cfg_upload)
-            if isinstance(uploaded_cfg, dict):
-                # fill missing
-                for r, d in CROP_CONFIG_DEFAULTS.items():
-                    uploaded_cfg.setdefault(r, d)
-                st.session_state["crop_cfg"] = uploaded_cfg
-                crop_cfg = uploaded_cfg
-                st.success("Loaded config JSON into this session.")
-        except Exception as e:
-            st.error(f"Could not load config JSON: {e}")
-
-    if save_defaults:
-        ok = save_crop_config(crop_cfg)
-        if ok:
-            st.success("Saved scan area defaults to crop_config.json.")
-            st.caption(
-                "Streamlit Cloud note: local files may reset after sleep. For permanent persistence, "
-                "commit crop_config.json to your GitHub repo."
+        c1, c2, c3, c4 = st.columns([1,1,1,1])
+        with c1:
+            use_box = st.button("Use drawn box", key="use_drawn_box")
+        with c2:
+            show_current = st.button("Show current box", key="show_current_box")
+        with c3:
+            save_defaults = st.button("Save as default", key="tuning_save")
+        with c4:
+            st.download_button(
+                "Download config JSON",
+                data=json.dumps(crop_cfg, indent=2).encode("utf-8"),
+                file_name="crop_config.json",
+                mime="application/json",
+                key="tuning_dl",
             )
-        else:
-            st.error("Could not save crop_config.json on this environment.")
 
-    if show_box:
-        if pdf_preview is None:
-            st.warning("Upload a PDF first.")
-        else:
+        cfg_upload = st.file_uploader("Upload config JSON (optional)", type=["json"], key="tuning_cfg_up")
+        if cfg_upload is not None:
             try:
-                png = render_scan_area_overlay(
-                    pdf_preview.getvalue(),
-                    t_retailer,
-                    page_index=int(page_preview) - 1,
-                    y0_frac=yy0,
-                    y1_frac=yy1,
-                )
-                st.image(png, caption=f"{t_retailer} scan area preview (page {int(page_preview)})", use_container_width=True)
+                uploaded_cfg = json.load(cfg_upload)
+                if isinstance(uploaded_cfg, dict):
+                    for r, d in CROP_CONFIG_DEFAULTS.items():
+                        uploaded_cfg.setdefault(r, d)
+                    st.session_state["crop_cfg"] = uploaded_cfg
+                    crop_cfg = uploaded_cfg
+                    st.success("Loaded config JSON into this session.")
             except Exception as e:
-                st.error(f"Could not render preview: {e}")
+                st.error(f"Could not load config JSON: {e}")
+
+        if use_box:
+            try:
+                objs = (canvas_result.json_data or {}).get("objects", [])
+                rects = [o for o in objs if o.get("type") == "rect"]
+                if not rects:
+                    st.warning("No rectangle found. Draw a box first.")
+                else:
+                    r = rects[-1]  # last drawn
+                    x = float(r.get("left", 0.0))
+                    y = float(r.get("top", 0.0))
+                    w = float(r.get("width", 0.0))
+                    h = float(r.get("height", 0.0))
+
+                    # Convert from top-left pixel coords to fractions.
+                    x0f = max(0.0, min(1.0, x / img_w))
+                    x1f = max(0.0, min(1.0, (x + w) / img_w))
+
+                    top_frac_from_top = max(0.0, min(1.0, y / img_h))
+                    bot_frac_from_top = max(0.0, min(1.0, (y + h) / img_h))
+
+                    # Convert to bottom-based y fractions
+                    y1f = max(0.0, min(1.0, 1.0 - top_frac_from_top))
+                    y0f = max(0.0, min(1.0, 1.0 - bot_frac_from_top))
+
+                    if x1f < x0f: x0f, x1f = x1f, x0f
+                    if y1f < y0f: y0f, y1f = y1f, y0f
+
+                    crop_cfg[t_retailer] = {"x0": x0f, "x1": x1f, "y0": y0f, "y1": y1f}
+                    st.session_state["crop_cfg"] = crop_cfg
+                    st.success(f"Updated {t_retailer} scan box: x[{x0f:.2f},{x1f:.2f}] y[{y0f:.2f},{y1f:.2f}]")
+
+            except Exception as e:
+                st.error(f"Could not apply drawn box: {e}")
+
+        if show_current:
+            try:
+                cur_cfg = st.session_state.get("crop_cfg", load_crop_config()).get(t_retailer, cur)
+                overlay = render_scan_area_overlay(pdf_bytes_preview, int(page_preview) - 1, cur_cfg, zoom=2.0)
+                st.image(overlay, caption="Current configured scan box (red)", use_container_width=True)
+            except Exception as e:
+                st.error(f"Could not render current box: {e}")
+
+        if save_defaults:
+            ok = save_crop_config(st.session_state.get("crop_cfg", crop_cfg))
+            if ok:
+                st.success("Saved scan area defaults to crop_config.json.")
+                st.caption("Streamlit Cloud: for permanent persistence after sleep, commit crop_config.json to your repo.")
+            else:
+                st.error("Could not save crop_config.json in this environment.")
 
 
 with tab_splitter:
-    st.caption(
-        "Upload a PDF and process it. Matching uses the scan area region (tuned in the other tab). "
-        "Lowe's SOS tag pages inherit the vendor from the prior page."
-    )
+    st.caption("Matching uses the scan rectangle from the Scan Area Tuning tab. Lowe's SOS tags inherit prior page vendor.")
 
     retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], index=1, key="splitter_retailer")
 
@@ -448,7 +447,6 @@ with tab_splitter:
 
     with st.expander("Vendor Map (built in by default)"):
         st.write(f"Default map file: `{DEFAULT_MAPS[retailer]}`")
-        st.write("Upload a different map for this run if needed.")
         map_upload = st.file_uploader(f"Optional: Upload a {retailer} vendor map (xlsx)", type=["xlsx"], key=f"map_{retailer}")
 
     pdf_file = st.file_uploader(f"Upload {retailer} PDF", type=["pdf"], key=f"pdf_{retailer}")
@@ -474,7 +472,6 @@ with tab_splitter:
         pdf_bytes = pdf_file.read()
         pdf_name = getattr(pdf_file, "name", "uploaded.pdf")
 
-        # Load map and lookup
         try:
             df_map = load_vendor_map(retailer, uploaded_file=map_upload)
             lookup = build_lookup(df_map, retailer)
