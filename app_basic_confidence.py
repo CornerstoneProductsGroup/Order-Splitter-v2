@@ -335,17 +335,67 @@ if _ensure_state_loaded():
     # Manual Override / Page Fixes
     # -----------------------------
     st.divider()
-    st.subheader("Fix Page Assignments")
+    st.subheader("Fix Pages That Need Review")
 
     st.caption(
-        "If a page was assigned to the wrong vendor (or routed to REVIEW due to low confidence), "
-        "you can override it here. After applying, the report and ZIP will update immediately."
+        "This list only includes pages that were not confidently sorted (REVIEW / UNKNOWN / MIXED). "
+        "You can correct them in bulk below. After applying, the report and ZIP will update."
     )
 
-    page_numbers = df_report["Page"].tolist()
-    sel_page = st.selectbox("Page number to change", page_numbers, index=0, key=f"override_page_{retailer}")
+    needs_review_mask = df_report["Vendor"].isin(["REVIEW", "UNKNOWN", "MIXED/REVIEW"])
+    df_needs = df_report.loc[needs_review_mask, ["Page", "Vendor", "Detected Vendor", "Confidence %", "Matched SKU/Model (first 15)"]].copy()
 
-    # Pull current row info
+    if df_needs.empty:
+        st.success("All pages were sorted to a vendor — nothing to review.")
+    else:
+        st.write("Bulk corrections (edit the Vendor column):")
+
+        edited = st.data_editor(
+            df_needs,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Vendor": st.column_config.SelectboxColumn(
+                    "Vendor (set correct one)",
+                    options=vendor_list_extended,
+                    required=True,
+                ),
+                "Page": st.column_config.NumberColumn("Page", disabled=True),
+                "Detected Vendor": st.column_config.TextColumn("Detected Vendor", disabled=True),
+                "Confidence %": st.column_config.NumberColumn("Confidence %", disabled=True),
+                "Matched SKU/Model (first 15)": st.column_config.TextColumn("Matched SKU/Model (first 15)", disabled=True),
+            },
+            key=f"bulk_editor_{retailer}"
+        )
+
+        apply_bulk = st.button("Apply bulk changes", type="secondary", key=f"apply_bulk_{retailer}")
+
+        if apply_bulk:
+            # Apply edits back to rows
+            edited_map = {int(r["Page"]): r["Vendor"] for _, r in edited.iterrows()}
+            for r in rows:
+                pg = int(r["Page"])
+                if pg in edited_map:
+                    r["Vendor"] = edited_map[pg]
+                    r["Detected Vendor"] = r.get("Detected Vendor", edited_map[pg])
+                    r["Confidence %"] = max(int(r.get("Confidence %", 0) or 0), 99)
+
+            st.session_state[f"rows_{retailer}"] = rows
+            st.success("Applied bulk changes.")
+            st.rerun()
+
+    # -----------------------------
+    # Optional: single page override
+    # -----------------------------
+    st.divider()
+    st.subheader("Change Any Specific Page")
+
+    st.caption("Use this if you want to change a page that was already assigned, or if you missed something above.")
+
+    page_numbers_all = df_report["Page"].tolist()
+    sel_page = st.selectbox("Page number to change", page_numbers_all, index=0, key=f"override_page_{retailer}")
+
     current_row = next((r for r in rows if r["Page"] == sel_page), None)
     if current_row is None:
         st.warning("Could not locate that page in the current run.")
@@ -366,21 +416,19 @@ if _ensure_state_loaded():
             key=f"override_vendor_{retailer}"
         )
 
-        apply_change = st.button("Apply change", type="secondary", key=f"apply_override_{retailer}")
+        apply_change = st.button("Apply single change", type="secondary", key=f"apply_override_{retailer}")
 
         if apply_change:
-            # Update row
             for r in rows:
                 if r["Page"] == sel_page:
                     r["Vendor"] = new_vendor
-                    # Keep original detected vendor for transparency; if absent, set it
                     r["Detected Vendor"] = r.get("Detected Vendor", new_vendor)
-                    # If user overrides, set confidence high so it doesn't get re-flagged by threshold later
                     r["Confidence %"] = max(int(r.get("Confidence %", 0) or 0), 99)
                     break
 
             st.session_state[f"rows_{retailer}"] = rows
             st.success(f"Updated page {sel_page} to vendor: {new_vendor}")
             st.rerun()
+
 else:
     st.info("Upload a PDF and click **Process PDF** to generate the report and vendor ZIP.")
