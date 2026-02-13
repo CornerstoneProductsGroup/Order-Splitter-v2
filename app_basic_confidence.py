@@ -6,9 +6,7 @@ import re
 from collections import defaultdict
 
 from pypdf import PdfReader, PdfWriter
-
-import smtplib
-import ssl
+import smtplib, ssl
 from email.message import EmailMessage
 
 
@@ -257,51 +255,23 @@ def build_zip(
 # UI
 # -----------------------------
 
-def send_vendor_email_smtp(
-    smtp_host: str,
-    smtp_port: int,
-    smtp_user: str,
-    smtp_password: str,
-    use_tls: bool,
-    sender_email: str,
-    to_emails: list[str],
-    subject: str,
-    body: str,
-    attachment_bytes: bytes,
-    attachment_filename: str,
-) -> tuple[bool, str]:
-    try:
-        msg = EmailMessage()
-        msg["From"] = sender_email
-        msg["To"] = ", ".join(to_emails)
-        msg["Subject"] = subject
-        msg.set_content(body)
-
-        msg.add_attachment(
-            attachment_bytes,
-            maintype="application",
-            subtype="pdf",
-            filename=attachment_filename,
-        )
-
-        context = ssl.create_default_context()
-        if use_tls:
-            with smtplib.SMTP(smtp_host, int(smtp_port), timeout=30) as server:
-                server.ehlo()
-                server.starttls(context=context)
-                server.ehlo()
-                if smtp_user:
-                    server.login(smtp_user, smtp_password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP_SSL(smtp_host, int(smtp_port), context=context, timeout=30) as server:
-                if smtp_user:
-                    server.login(smtp_user, smtp_password)
-                server.send_message(msg)
-
-        return True, "Sent"
-    except Exception as e:
-        return False, str(e)
+def send_email_simple(host, port, user, pwd, use_tls, sender, to_list, subject, body, pdf_bytes, filename):
+    msg = EmailMessage()
+    msg["From"]=sender
+    msg["To"]=", ".join(to_list)
+    msg["Subject"]=subject
+    msg.set_content(body)
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
+    ctx=ssl.create_default_context()
+    if use_tls:
+        with smtplib.SMTP(host, int(port)) as s:
+            s.starttls(context=ctx)
+            if user: s.login(user,pwd)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP_SSL(host, int(port), context=ctx) as s:
+            if user: s.login(user,pwd)
+            s.send_message(msg)
 
 
 st.set_page_config(page_title="Retail Order Splitter (Basic)", layout="wide")
@@ -450,83 +420,7 @@ if _ensure_state_loaded():
         mime="text/csv"
     )
 
-    
-    # -----------------------------
-    # Auto Email (SMTP) - Clean + stable
-    # -----------------------------
-    with st.expander("Auto Email (SMTP)", expanded=False):
-        st.caption(
-            "Pick a vendor PDF and email it. "
-            "For Gmail/Google Workspace you typically need an App Password. "
-            "Use Streamlit Secrets for credentials if deploying to Streamlit Cloud."
-        )
-
-        smtp_secrets = st.secrets.get("smtp", {}) if hasattr(st, "secrets") else {}
-
-        smtp_host = st.text_input("SMTP host", value=str(smtp_secrets.get("host", "smtp.gmail.com")), key=f"smtp_host_{retailer}")
-        smtp_port = st.number_input("SMTP port", min_value=1, max_value=65535, value=int(smtp_secrets.get("port", 587) or 587), step=1, key=f"smtp_port_{retailer}")
-        use_tls = st.checkbox("Use STARTTLS", value=bool(smtp_secrets.get("use_tls", True)), key=f"smtp_tls_{retailer}")
-
-        smtp_user = st.text_input("SMTP username", value=str(smtp_secrets.get("user", "")), key=f"smtp_user_{retailer}")
-        smtp_password = st.text_input("SMTP password / app password", value=str(smtp_secrets.get("password", "")), type="password", key=f"smtp_pass_{retailer}")
-        sender_email = st.text_input("From email", value=str(smtp_secrets.get("from_email", smtp_user)), key=f"smtp_from_{retailer}")
-
-        sendable_vendors = sorted([v for v in vendor_pdfs.keys() if v not in ("REVIEW", "UNKNOWN", "MIXED/REVIEW")], key=lambda x: x.lower())
-        if not sendable_vendors:
-            st.info("No vendor PDFs available to email.")
-        else:
-            selected_vendor = st.selectbox("Vendor to email", sendable_vendors, key=f"email_vendor_{retailer}")
-            to_emails_raw = st.text_input("Recipient email(s) (comma/semicolon separated)", value="", key=f"email_to_{retailer}")
-
-            subj = st.text_input(
-                "Subject",
-                value=f"{retailer} Orders - {selected_vendor}",
-                key=f"email_subject_{retailer}",
-            )
-            body = st.text_area(
-                "Body",
-                value="Attached are the latest orders.",
-                height=120,
-                key=f"email_body_{retailer}",
-            )
-
-            if "email_log" not in st.session_state:
-                st.session_state["email_log"] = []
-
-            if st.button("Send email", type="primary", key=f"email_send_{retailer}"):
-                def _split(s: str) -> list[str]:
-                    parts = re.split(r"[;, \n]+", (s or "").strip())
-                    return [p.strip() for p in parts if p.strip()]
-
-                to_list = _split(to_emails_raw)
-                if not smtp_host.strip():
-                    st.error("SMTP host is required.")
-                elif not sender_email.strip():
-                    st.error("From email is required.")
-                elif not to_list:
-                    st.error("Enter at least one recipient email.")
-                else:
-                    ok, msg = send_vendor_email_smtp(
-                        smtp_host=smtp_host,
-                        smtp_port=int(smtp_port),
-                        smtp_user=smtp_user,
-                        smtp_password=smtp_password,
-                        use_tls=use_tls,
-                        sender_email=sender_email,
-                        to_emails=to_list,
-                        subject=subj,
-                        body=body,
-                        attachment_bytes=vendor_pdfs[selected_vendor],
-                        attachment_filename=f"{re.sub(r'\\.pdf$', '', pdf_name, flags=re.IGNORECASE)} - {selected_vendor}.pdf",
-                    )
-                    st.session_state["email_log"].append({"Vendor": selected_vendor, "To": ", ".join(to_list), "Status": "OK" if ok else "FAIL", "Message": msg})
-                    st.success("Email sent!") if ok else st.error(f"Send failed: {msg}")
-
-            if st.session_state.get("email_log"):
-                st.markdown("**Email log**")
-                st.dataframe(pd.DataFrame(st.session_state["email_log"]).tail(50), use_container_width=True, hide_index=True)
-
-st.subheader("Summary")
+    st.subheader("Summary")
     counts = df_report["Vendor"].value_counts().reset_index()
     counts.columns = ["Vendor", "Pages"]
     st.dataframe(counts, use_container_width=True, hide_index=True)
@@ -535,7 +429,28 @@ st.subheader("Summary")
     # Manual Override / Page Fixes
     # -----------------------------
     st.divider()
-    st.subheader("Fix / Override Page Assignments")
+    
+        with st.expander("Auto Email (simple)", expanded=False):
+            smtp_host = st.text_input("SMTP host","smtp.gmail.com")
+            smtp_port = st.number_input("SMTP port", value=587)
+            use_tls = st.checkbox("Use TLS", True)
+            smtp_user = st.text_input("SMTP user")
+            smtp_pwd = st.text_input("SMTP password", type="password")
+            sender = st.text_input("From email", smtp_user)
+            vendors = [v for v in vendor_pdfs.keys() if v not in ("REVIEW","UNKNOWN","MIXED/REVIEW")]
+            if vendors:
+                vsel = st.selectbox("Vendor", vendors)
+                to = st.text_input("To email(s)")
+                if st.button("Send email"):
+                    try:
+                        tos=[x.strip() for x in re.split("[,; ]+",to) if x.strip()]
+                        send_email_simple(smtp_host,smtp_port,smtp_user,smtp_pwd,use_tls,sender,tos,
+                                          f"{retailer} Orders - {vsel}","Attached orders",
+                                          vendor_pdfs[vsel], f"{vsel}.pdf")
+                        st.success("Email sent")
+                    except Exception as e:
+                        st.error(str(e))
+st.subheader("Fix / Override Page Assignments")
 
     st.caption(
         "This section is always available after processing so you can override any page if needed. "
