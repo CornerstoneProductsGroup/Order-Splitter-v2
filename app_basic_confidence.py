@@ -184,11 +184,14 @@ def render_scan_area_overlay(pdf_bytes: bytes, page_index: int, rect_cfg: dict, 
 
 
 
+
 def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg: dict) -> list[dict]:
     """
-    Extracts both full-page text and scan-region text.
-    Region text is extracted using PyMuPDF clipping (more reliable for constrained areas).
-    Falls back to pypdf extraction if needed.
+    Rotation-safe extraction:
+    - Full text via pypdf (for SOS detection etc.)
+    - Region text built by filtering PyMuPDF "words" that fall inside the scan rectangle.
+      We compute the scan rectangle in the rendered (rotated) page space, then transform it
+      into the unrotated text space using page.derotation_matrix.
     """
     cfg = crop_cfg.get(retailer, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
     x0f = float(cfg.get("x0", 0.0))
@@ -200,6 +203,7 @@ def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg:
     if y1f < y0f:
         y0f, y1f = y1f, y0f
 
+    # Full text via pypdf (stable for whole-page)
     reader = PdfReader(BytesIO(pdf_bytes))
     full_texts = []
     for page in reader.pages:
@@ -213,31 +217,34 @@ def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for i in range(doc.page_count):
             page = doc.load_page(i)
+
+            # Build scan rect in rotated/rendered page space (same as the preview box)
             w = page.rect.width
             h = page.rect.height
-
             left = x0f * w
             right = x1f * w
             top = (1 - y1f) * h
             bottom = (1 - y0f) * h
+            rect_rot = fitz.Rect(left, top, right, bottom)
 
-            clip = fitz.Rect(left, top, right, bottom)
-            try:
-                txt = page.get_text("text", clip=clip) or ""
-            except Exception:
-                txt = ""
-            txt = txt.strip()
+            # Transform to unrotated text space so it matches PyMuPDF word coordinates
+            rect = rect_rot * page.derotation_matrix
+
+            words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,wordno) in unrotated space
+            # Filter words fully inside rect (with small tolerance)
+            tol = 1.0
+            picked = [w for w in words if (w[0] >= rect.x0 - tol and w[2] <= rect.x1 + tol and w[1] >= rect.y0 - tol and w[3] <= rect.y1 + tol)]
+
+            # Sort in reading order (top->bottom then left->right)
+            picked.sort(key=lambda x: (round(x[1], 1), x[0]))
+            txt = " ".join([w[4] for w in picked]).strip()
             if not txt:
                 txt = full_texts[i]
             region_texts.append(txt)
     except Exception:
         region_texts = full_texts[:]
 
-    out = []
-    for i in range(len(full_texts)):
-        out.append({"full": full_texts[i], "region": region_texts[i]})
-    return out
-
+    return [{"full": full_texts[i], "region": region_texts[i]} for i in range(len(full_texts))]
 
 
 def match_vendor(text: str, lookup: dict) -> tuple[str, list[str], int]:
