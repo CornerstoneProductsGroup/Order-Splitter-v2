@@ -66,6 +66,16 @@ def load_vendor_map(retailer: str, uploaded_file=None) -> pd.DataFrame:
 
 
 def build_lookup(df: pd.DataFrame, retailer: str) -> dict:
+    """
+    Build SKU/Model -> Vendor lookup.
+
+    Important: we intentionally skip "too-short" alpha-only keys (e.g., "ORU"),
+    because substring matching on short words can create false positives from
+    common phrases like "FOR OUR", "YOUR", etc.
+    Rule:
+      - keep if the normalized key contains ANY digit, OR length >= 4
+      - skip if alpha-only and length < 4
+    """
     key_col = MAP_KEY_COL[retailer]
     if key_col not in df.columns or MAP_VENDOR_COL not in df.columns:
         raise ValueError(
@@ -73,15 +83,34 @@ def build_lookup(df: pd.DataFrame, retailer: str) -> dict:
             f"Found: {list(df.columns)}"
         )
     lookup = {}
+    skipped_short = 0
+
     for _, row in df.iterrows():
-        k = normalize_key(row.get(key_col))
+        k_raw = row.get(key_col)
+        k = normalize_key(k_raw)
         v = row.get(MAP_VENDOR_COL)
+
         if pd.notna(v):
             v = str(v).strip()
         else:
             v = ""
-        if k and v:
-            lookup[k] = v
+
+        if not k or not v:
+            continue
+
+        has_digit = any(ch.isdigit() for ch in k)
+        if (not has_digit) and len(k) < 4:
+            skipped_short += 1
+            continue
+
+        lookup[k] = v
+
+    # stash a small diagnostic for UI
+    try:
+        st.session_state["_skipped_short_keys"] = int(skipped_short)
+    except Exception:
+        pass
+
     return lookup
 
 
@@ -153,7 +182,13 @@ def render_scan_area_overlay(pdf_bytes: bytes, page_index: int, rect_cfg: dict, 
     return buf.getvalue()
 
 
+
 def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg: dict) -> list[dict]:
+    """
+    Extracts both full-page text and scan-region text.
+    Region text is extracted using PyMuPDF clipping (more reliable for constrained areas).
+    Falls back to pypdf extraction if needed.
+    """
     cfg = crop_cfg.get(retailer, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
     x0f = float(cfg.get("x0", 0.0))
     x1f = float(cfg.get("x1", 1.0))
@@ -165,59 +200,59 @@ def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg:
         y0f, y1f = y1f, y0f
 
     reader = PdfReader(BytesIO(pdf_bytes))
-    out = []
-
+    full_texts = []
     for page in reader.pages:
         try:
-            full_text = page.extract_text() or ""
+            full_texts.append(page.extract_text() or "")
         except Exception:
-            full_text = ""
+            full_texts.append("")
 
-        # Region extraction via visitor_text, using PDF coordinate system (bottom-left origin)
-        try:
-            mb = page.mediabox
-            left = float(mb.left)
-            right = float(mb.right)
-            bottom = float(mb.bottom)
-            top = float(mb.top)
-            w = right - left
-            h = top - bottom
+    region_texts = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            w = page.rect.width
+            h = page.rect.height
 
-            rx0 = left + x0f * w
-            rx1 = left + x1f * w
-            ry0 = bottom + y0f * h
-            ry1 = bottom + y1f * h
+            left = x0f * w
+            right = x1f * w
+            top = (1 - y1f) * h
+            bottom = (1 - y0f) * h
 
-            chunks = []
+            clip = fitz.Rect(left, top, right, bottom)
+            try:
+                txt = page.get_text("text", clip=clip) or ""
+            except Exception:
+                txt = ""
+            txt = txt.strip()
+            if not txt:
+                txt = full_texts[i]
+            region_texts.append(txt)
+    except Exception:
+        region_texts = full_texts[:]
 
-            def visitor_text(text, cm, tm, font_dict, font_size):
-                try:
-                    x = float(tm[4])
-                    y = float(tm[5])
-                except Exception:
-                    return
-                if rx0 <= x <= rx1 and ry0 <= y <= ry1:
-                    chunks.append(text)
-
-            page.extract_text(visitor_text=visitor_text)
-            region_text = "".join(chunks).strip()
-            if not region_text:
-                region_text = full_text
-        except Exception:
-            region_text = full_text
-
-        out.append({"full": full_text, "region": region_text})
-
+    out = []
+    for i in range(len(full_texts)):
+        out.append({"full": full_texts[i], "region": region_texts[i]})
     return out
 
 
+
 def match_vendor(text: str, lookup: dict) -> tuple[str, list[str], int]:
-    t = normalize_key(text)
+    raw = (text or "").upper()
+    compact = normalize_key(text)
     matched = []
     vendors = set()
 
     for k, vendor in lookup.items():
-        if k and k in t:
+        if not k:
+            continue
+        if k in compact:
+            matched.append(k)
+            vendors.add(vendor)
+            continue
+        if re.search(rf"\b{re.escape(k)}\b", raw):
             matched.append(k)
             vendors.add(vendor)
 
@@ -359,10 +394,15 @@ with tab_tune:
 with tab_split:
     retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], index=1, key="retailer")
     confidence_threshold = st.slider("Confidence threshold", 0, 100, 70, 5)
+    fallback_full = st.checkbox("Fallback to full-page text if scan area extraction is empty (not recommended)", value=False)
 
     with st.expander("Vendor Map (built in by default)"):
         st.write(f"Default map file: `{DEFAULT_MAPS[retailer]}`")
         map_upload = st.file_uploader("Optional: upload vendor map (xlsx)", type=["xlsx"], key="map_upload")
+        st.caption("Note: the app ignores alpha-only keys shorter than 4 characters (ex: 'ORU') to prevent false positives.")
+        if "_skipped_short_keys" in st.session_state:
+            st.caption(f"Last run: skipped {st.session_state.get('_skipped_short_keys',0)} short keys from the map.")
+
 
     pdf_file = st.file_uploader("Upload PDF", type=["pdf"], key="pdf_upload")
 
@@ -399,9 +439,10 @@ with tab_split:
         rows = []
         for i, pobj in enumerate(pages):
             full = pobj.get("full", "")
-            region = pobj.get("region", full)
+            region = pobj.get("region", "")
 
-            # Lowe's SOS tag: assign to vendor above
+            # Lowe's SOS tag: detect by scanning the FULL page text, then assign to vendor above.
+            # IMPORTANT: for normal matching we still only use the scan-area (region) text.
             if retailer == "Lowe's" and is_sos_tag_page(full):
                 if rows:
                     final_vendor = rows[-1]["Vendor"]
@@ -422,7 +463,25 @@ with tab_split:
                 })
                 continue
 
-            vendor, matched, conf = match_vendor(region, lookup)
+            # For Home Depot and Tractor Supply: ONLY use scan-area text.
+            # For Lowe's: also only use scan-area for matching (SOS detection handled above).
+            scan_text = (region or "").strip()
+
+            if not scan_text:
+                if fallback_full:
+                    scan_text = (full or "").strip()
+                else:
+                    rows.append({
+                        "Page": i + 1,
+                        "Vendor": "REVIEW",
+                        "Detected Vendor": "NO_TEXT_IN_SCAN_AREA",
+                        "Confidence %": 0,
+                        "Matched SKU/Model (first 15)": "",
+                        "SOS Tag": False,
+                    })
+                    continue
+
+            vendor, matched, conf = match_vendor(scan_text, lookup)
 
             final_vendor = vendor
             if conf < confidence_threshold and vendor not in ("UNKNOWN", "MIXED/REVIEW"):
@@ -442,8 +501,10 @@ with tab_split:
             "pdf_bytes": pdf_bytes,
             "pdf_name": pdf_name,
             "vendor_list_extended": vendor_list_extended,
+            "pages": pages,
         }
         st.success("Processed. Scroll down for downloads and overrides.")
+        st.caption("Scan rule: Home Depot & Tractor Supply match ONLY within the scan box. Lowe’s matches within the scan box, but SOS detection uses the full page.")
 
     if state_key in st.session_state:
         run = st.session_state[state_key]
@@ -451,6 +512,7 @@ with tab_split:
         pdf_bytes = run["pdf_bytes"]
         pdf_name = run["pdf_name"]
         vendor_list_extended = run["vendor_list_extended"]
+        pages = run.get("pages", [])
 
         df_report = pd.DataFrame(rows)
         st.subheader("Page → Vendor Report")
@@ -505,6 +567,15 @@ with tab_split:
         st.markdown("### Override any specific page")
         page_list = df_report["Page"].tolist()
         sel_page = st.selectbox("Page number", page_list, index=0, key=f"override_page_{retailer}")
+
+        with st.expander("Debug: show extracted scan text for selected page", expanded=False):
+            try:
+                page_idx = int(sel_page) - 1
+                scan_text = pages[page_idx]["region"] if pages and page_idx < len(pages) else ""
+                st.write("Extracted region text (first 800 chars):")
+                st.code((scan_text or "")[:800])
+            except Exception as e:
+                st.write(f"Debug unavailable: {e}")
 
         # Preview selected page with scan box
         try:
