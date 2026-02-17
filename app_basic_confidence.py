@@ -35,8 +35,8 @@ WAREHOUSE_VENDORS = [
     "Post Protector-Here",
     "Soft Seal",
     "Weedshark",
-    "Zaca",,
-    "Cornerstone"
+    "Zaca",
+    "Cornerstone",
 ]
 
 CROP_CONFIG_PATH = "crop_config.json"
