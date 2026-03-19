@@ -48,11 +48,6 @@ OUTPUT_DIRS: dict[str, Path] = {
     "Lowe's":         OUTPUT_ROOT / "Lowe's",
     "Tractor Supply": OUTPUT_ROOT / "Tractor Supply",
 }
-REVIEW_DIRS: dict[str, Path] = {
-    "Home Depot":     OUTPUT_DIRS["Home Depot"] / "Needs Review",
-    "Lowe's":         OUTPUT_DIRS["Lowe's"] / "Needs Review",
-    "Tractor Supply": OUTPUT_DIRS["Tractor Supply"] / "Needs Review",
-}
 
 ROUTES_XLSX_PATH = Path("Vendor Output Routes.xlsx")
 ROUTES_REQUIRED_COLS = ["Retailer", "Vendor"]
@@ -351,12 +346,23 @@ def build_warehouse_print_pdf(
     return buf.getvalue()
 
 
-def build_zip(vendor_pdfs: dict[str, bytes], base_name: str, warehouse_print_pdf: bytes | None) -> bytes:
+def build_zip(
+    vendor_pdfs: dict[str, bytes],
+    base_name: str,
+    warehouse_print_pdf: bytes | None,
+    report_csv: bytes,
+    review_files: dict[str, bytes],
+) -> bytes:
     buf = BytesIO()
     base = re.sub(r"\.pdf$", "", base_name, flags=re.IGNORECASE).strip()
     base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or "Orders"
 
     with zf.ZipFile(buf, "w", compression=zf.ZIP_DEFLATED) as z:
+        z.writestr(f"{base} - Report.csv", report_csv)
+
+        for rel_name, data in review_files.items():
+            z.writestr(f"Needs Review/{rel_name}", data)
+
         if warehouse_print_pdf is not None:
             z.writestr(f"{base} - WAREHOUSE PRINT.pdf", warehouse_print_pdf)
         for vendor, data in vendor_pdfs.items():
@@ -425,7 +431,6 @@ def process_pdf(
     retailer: str,
     crop_cfg: dict,
     output_dir: Path,
-    review_dir: Path,
     routes: dict[tuple[str, str], Path],
     logger: logging.Logger,
 ) -> None:
@@ -499,32 +504,36 @@ def process_pdf(
     page_vendor_rows = [{"PageIndex": int(r["Page"]) - 1, "Vendor": r["Vendor"]} for r in rows]
     vendor_pdfs      = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
     warehouse_pdf    = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
-    zip_bytes        = build_zip(vendor_pdfs, base_name=pdf_name, warehouse_print_pdf=warehouse_pdf)
     df_report        = pd.DataFrame(rows)
 
     base         = re.sub(r"\.pdf$", "", pdf_name, flags=re.IGNORECASE).strip()
     retailer_slug = re.sub(r"[^\w]", "_", retailer)
     out_zip      = output_dir / f"{base}_{retailer_slug}_VendorPdfs.zip"
-    out_csv      = output_dir / f"{base}_{retailer_slug}_Report.csv"
-
-    out_zip.write_bytes(zip_bytes)
-    df_report.to_csv(out_csv, index=False)
     write_and_route_vendor_pdfs(vendor_pdfs, pdf_name, retailer, output_dir, routes, logger)
 
     flagged = df_report[df_report["Vendor"].isin(["REVIEW", "UNKNOWN", "MIXED/REVIEW"])].copy()
     review_count = int(flagged.shape[0])
 
+    report_csv_bytes = df_report.to_csv(index=False).encode("utf-8")
+    review_files: dict[str, bytes] = {}
     if review_count:
-        review_pdf = review_dir / pdf_name
-        review_csv = review_dir / f"{base}_{retailer_slug}_NeedsReview.csv"
-        review_pdf.write_bytes(pdf_bytes)
-        flagged.to_csv(review_csv, index=False)
+        review_files[pdf_name] = pdf_bytes
+        review_files[f"{base}_{retailer_slug}_NeedsReview.csv"] = flagged.to_csv(index=False).encode("utf-8")
+
+    zip_bytes = build_zip(
+        vendor_pdfs,
+        base_name=pdf_name,
+        warehouse_print_pdf=warehouse_pdf,
+        report_csv=report_csv_bytes,
+        review_files=review_files,
+    )
+    out_zip.write_bytes(zip_bytes)
 
     logger.info("[%s] Done → %s", retailer, out_zip.name)
     if review_count:
         logger.warning(
-            "[%s] %d page(s) flagged for review — check %s and %s",
-            retailer, review_count, review_pdf.name, review_csv.name,
+            "[%s] %d page(s) flagged for review — included in ZIP under Needs Review/",
+            retailer, review_count,
         )
 
 
@@ -538,7 +547,6 @@ class PDFHandler(FileSystemEventHandler):
         retailer: str,
         crop_cfg: dict,
         output_dir: Path,
-        review_dir: Path,
         routes: dict[tuple[str, str], Path],
         logger: logging.Logger,
     ) -> None:
@@ -546,7 +554,6 @@ class PDFHandler(FileSystemEventHandler):
         self.retailer  = retailer
         self.crop_cfg  = crop_cfg
         self.output_dir = output_dir
-        self.review_dir = review_dir
         self.routes = routes
         self.logger    = logger
         self._last_seen: dict[str, float] = {}
@@ -571,7 +578,7 @@ class PDFHandler(FileSystemEventHandler):
             return
 
         try:
-            process_pdf(path, self.retailer, self.crop_cfg, self.output_dir, self.review_dir, self.routes, self.logger)
+            process_pdf(path, self.retailer, self.crop_cfg, self.output_dir, self.routes, self.logger)
         except Exception as e:
             self.logger.exception(
                 "[%s] Unhandled error processing %s: %s", self.retailer, path.name, e
@@ -608,24 +615,23 @@ def main() -> None:
     routes = load_vendor_output_routes(ROUTES_XLSX_PATH, logger)
     route_dirs = list({p for p in routes.values()})
 
-    if os.name != "nt" and any(str(p).startswith("\\\\") for p in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *REVIEW_DIRS.values(), *route_dirs]):
+    if os.name != "nt" and any(str(p).startswith("\\\\") for p in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs]):
         logger.error("UNC paths were configured, but this host is not Windows.")
         logger.error("Run watcher.py on a Windows machine that can access the network share.")
         return
 
     # Ensure all directories exist
-    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *REVIEW_DIRS.values(), *route_dirs]:
+    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs]:
         d.mkdir(parents=True, exist_ok=True)
 
     crop_cfg = load_crop_config()
 
     observer = Observer()
     for retailer, watch_dir in WATCH_DIRS.items():
-        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], REVIEW_DIRS[retailer], routes, logger)
+        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], routes, logger)
         observer.schedule(handler, str(watch_dir), recursive=False)
         logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
         logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
-        logger.info("Review   [%-14s] → %s/", retailer, REVIEW_DIRS[retailer])
 
     logger.info("Watcher running. Drop PDF files into a watch folder. Press Ctrl+C to stop.\n")
 
