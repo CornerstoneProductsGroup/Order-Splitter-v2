@@ -83,12 +83,88 @@ WAREHOUSE_VENDORS = [
 
 CROP_CONFIG_PATH = "crop_config.json"
 CROP_CONFIG_DEFAULTS: dict[str, dict] = {
-    "Home Depot":     {"x0": 0.02, "x1": 0.14, "y0": 0.26, "y1": 0.54},
-    "Lowe's":         {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
-    "Tractor Supply": {"x0": 0.14, "x1": 0.30, "y0": 0.20, "y1": 0.55},
+    "Home Depot": {
+        "extract_region": {"x0": 0.02, "x1": 0.14, "y0": 0.26, "y1": 0.54},
+    },
+    "Lowe's": {
+        "extract_region": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
+        "sos_output_crop": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
+    },
+    "Tractor Supply": {
+        "extract_region": {"x0": 0.14, "x1": 0.30, "y0": 0.20, "y1": 0.55},
+        "redact_regions": [],
+    },
 }
 
 CONFIDENCE_THRESHOLD = 70  # pages below this are flagged REVIEW
+
+
+def _normalize_region(region: dict | None, fallback: dict | None = None) -> dict:
+    base = fallback or {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0}
+    src = region or {}
+    x0f = float(src.get("x0", base.get("x0", 0.0)))
+    x1f = float(src.get("x1", base.get("x1", 1.0)))
+    y0f = float(src.get("y0", base.get("y0", 0.0)))
+    y1f = float(src.get("y1", base.get("y1", 1.0)))
+
+    x0f = max(0.0, min(1.0, x0f))
+    x1f = max(0.0, min(1.0, x1f))
+    y0f = max(0.0, min(1.0, y0f))
+    y1f = max(0.0, min(1.0, y1f))
+
+    if x1f < x0f:
+        x0f, x1f = x1f, x0f
+    if y1f < y0f:
+        y0f, y1f = y1f, y0f
+
+    return {"x0": x0f, "x1": x1f, "y0": y0f, "y1": y1f}
+
+
+def _extract_region_from_cfg(retailer: str, crop_cfg: dict) -> dict:
+    raw = crop_cfg.get(retailer, {})
+    if not isinstance(raw, dict):
+        return {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0}
+
+    # Backward compatible: legacy config had x0/x1/y0/y1 at the retailer root.
+    if all(k in raw for k in ("x0", "x1", "y0", "y1")):
+        return _normalize_region(raw)
+
+    return _normalize_region(raw.get("extract_region"))
+
+
+def _sos_crop_region_from_cfg(crop_cfg: dict) -> dict | None:
+    raw = crop_cfg.get("Lowe's", {})
+    if not isinstance(raw, dict):
+        return None
+    region = raw.get("sos_output_crop")
+    if not isinstance(region, dict):
+        return None
+    return _normalize_region(region)
+
+
+def _redact_regions_from_cfg(crop_cfg: dict) -> list[dict]:
+    raw = crop_cfg.get("Tractor Supply", {})
+    if not isinstance(raw, dict):
+        return []
+    regions = raw.get("redact_regions", [])
+    if not isinstance(regions, list):
+        return []
+
+    cleaned: list[dict] = []
+    for reg in regions:
+        if isinstance(reg, dict):
+            cleaned.append(_normalize_region(reg))
+    return cleaned
+
+
+def _region_to_rect(page: fitz.Page, region: dict) -> fitz.Rect:
+    w = page.rect.width
+    h = page.rect.height
+    left = region["x0"] * w
+    right = region["x1"] * w
+    top = (1 - region["y1"]) * h
+    bottom = (1 - region["y0"]) * h
+    return fitz.Rect(left, top, right, bottom)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core processing helpers  (exact copies of the logic in app.py)
@@ -225,15 +301,11 @@ def is_sos_tag_page(text: str) -> bool:
 
 
 def extract_text_by_page_with_regions(pdf_bytes: bytes, retailer: str, crop_cfg: dict) -> list[dict]:
-    cfg = crop_cfg.get(retailer, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
-    x0f = float(cfg.get("x0", 0.0))
-    x1f = float(cfg.get("x1", 1.0))
-    y0f = float(cfg.get("y0", 0.0))
-    y1f = float(cfg.get("y1", 1.0))
-    if x1f < x0f:
-        x0f, x1f = x1f, x0f
-    if y1f < y0f:
-        y0f, y1f = y1f, y0f
+    cfg = _extract_region_from_cfg(retailer, crop_cfg)
+    x0f = cfg["x0"]
+    x1f = cfg["x1"]
+    y0f = cfg["y0"]
+    y1f = cfg["y1"]
 
     reader = PdfReader(BytesIO(pdf_bytes))
     full_texts: list[str] = []
@@ -306,20 +378,39 @@ def match_vendor(text: str, lookup: dict) -> tuple[str, list[str], int]:
     return next(iter(vendors)), matched[:15], conf
 
 
-def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict]) -> dict[str, bytes]:
-    reader = PdfReader(BytesIO(pdf_bytes))
+def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: str, crop_cfg: dict) -> dict[str, bytes]:
+    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_by_vendor: dict[str, list[int]] = defaultdict(list)
+    row_by_page: dict[int, dict] = {}
     for r in page_vendor_rows:
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
+        row_by_page[r["PageIndex"]] = r
+
+    sos_crop = _sos_crop_region_from_cfg(crop_cfg) if retailer == "Lowe's" else None
+    redact_regions = _redact_regions_from_cfg(crop_cfg) if retailer == "Tractor Supply" else []
 
     vendor_pdfs: dict[str, bytes] = {}
     for vendor, idxs in pages_by_vendor.items():
-        writer = PdfWriter()
+        out_doc = fitz.open()
         for i in idxs:
-            writer.add_page(reader.pages[i])
+            out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
+            page = out_doc[-1]
+            row = row_by_page.get(i, {})
+
+            if sos_crop is not None and bool(row.get("SOS Tag", False)):
+                page.set_cropbox(_region_to_rect(page, sos_crop))
+
+            if redact_regions:
+                for reg in redact_regions:
+                    page.add_redact_annot(_region_to_rect(page, reg), fill=(0, 0, 0))
+                page.apply_redactions()
+
         buf = BytesIO()
-        writer.write(buf)
+        out_doc.save(buf)
+        out_doc.close()
         vendor_pdfs[vendor] = buf.getvalue()
+
+    src_doc.close()
     return vendor_pdfs
 
 
@@ -501,8 +592,15 @@ def process_pdf(
         })
 
     # Build outputs
-    page_vendor_rows = [{"PageIndex": int(r["Page"]) - 1, "Vendor": r["Vendor"]} for r in rows]
-    vendor_pdfs      = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
+    page_vendor_rows = [
+        {
+            "PageIndex": int(r["Page"]) - 1,
+            "Vendor": r["Vendor"],
+            "SOS Tag": bool(r.get("SOS Tag", False)),
+        }
+        for r in rows
+    ]
+    vendor_pdfs      = build_vendor_pdfs(pdf_bytes, page_vendor_rows, retailer, crop_cfg)
     warehouse_pdf    = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
     df_report        = pd.DataFrame(rows)
 
