@@ -4,3 +4,4 @@ openpyxl>=3.1
 pypdf>=4.0
 pymupdf>=1.23
 pillow>=10.0
+watchdog>=4.0
