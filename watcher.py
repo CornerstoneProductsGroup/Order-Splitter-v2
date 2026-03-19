@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import zipfile as zf
 from collections import defaultdict
@@ -53,6 +54,10 @@ REVIEW_DIRS: dict[str, Path] = {
     "Lowe's":         OUTPUT_DIRS["Lowe's"] / "Needs Review",
     "Tractor Supply": OUTPUT_DIRS["Tractor Supply"] / "Needs Review",
 }
+
+ROUTES_XLSX_PATH = Path("Vendor Output Routes.xlsx")
+ROUTES_REQUIRED_COLS = ["Retailer", "Vendor"]
+ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (mirrors app.py)
@@ -101,6 +106,81 @@ def normalize_key(x: str) -> str:
     s = str(x).strip().upper()
     s = re.sub(r"[\s\-_]", "", s)
     return s
+
+
+def normalize_label(x: str) -> str:
+    if x is None:
+        return ""
+    return re.sub(r"[^A-Z0-9]+", "", str(x).strip().upper())
+
+
+def _is_enabled_cell(v) -> bool:
+    if pd.isna(v):
+        return True
+    s = str(v).strip().lower()
+    return s in {"1", "true", "yes", "y", "on", "enabled", ""}
+
+
+def load_vendor_output_routes(xlsx_path: Path, logger: logging.Logger) -> dict[tuple[str, str], Path]:
+    if not xlsx_path.exists():
+        logger.warning("Routes file not found: %s (routing disabled)", xlsx_path)
+        return {}
+
+    try:
+        df = pd.read_excel(xlsx_path)
+    except Exception as e:
+        logger.error("Could not read routes file %s: %s", xlsx_path, e)
+        return {}
+
+    missing = [c for c in ROUTES_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        logger.error("Routes file missing columns %s. Expected: %s", missing, ROUTES_REQUIRED_COLS)
+        return {}
+
+    path_col = next((c for c in ROUTES_PATH_COL_CANDIDATES if c in df.columns), None)
+    if path_col is None:
+        logger.error("Routes file missing path column. Expected one of: %s", ROUTES_PATH_COL_CANDIDATES)
+        return {}
+
+    routes: dict[tuple[str, str], Path] = {}
+    enabled_col = "Enabled" if "Enabled" in df.columns else None
+
+    for _, row in df.iterrows():
+        if enabled_col and not _is_enabled_cell(row.get(enabled_col)):
+            continue
+
+        retailer = normalize_label(row.get("Retailer"))
+        vendor = normalize_label(row.get("Vendor"))
+        dest_raw = row.get(path_col)
+
+        if not retailer or not vendor or pd.isna(dest_raw):
+            continue
+
+        dest = Path(str(dest_raw).strip())
+        if not str(dest):
+            continue
+
+        routes[(retailer, vendor)] = dest
+
+    logger.info("Loaded %d vendor output route(s) from %s", len(routes), xlsx_path)
+    return routes
+
+
+def resolve_route_path(routes: dict[tuple[str, str], Path], retailer: str, vendor: str) -> Path | None:
+    r = normalize_label(retailer)
+    v = normalize_label(vendor)
+
+    # Supports explicit matches and default fallbacks.
+    candidates = [
+        (r, v),
+        (r, "DEFAULT"),
+        ("DEFAULT", v),
+        ("DEFAULT", "DEFAULT"),
+    ]
+    for key in candidates:
+        if key in routes:
+            return routes[key]
+    return None
 
 
 def load_crop_config() -> dict:
@@ -287,6 +367,36 @@ def build_zip(vendor_pdfs: dict[str, bytes], base_name: str, warehouse_print_pdf
     return buf.getvalue()
 
 
+def write_and_route_vendor_pdfs(
+    vendor_pdfs: dict[str, bytes],
+    base_name: str,
+    retailer: str,
+    output_dir: Path,
+    routes: dict[tuple[str, str], Path],
+    logger: logging.Logger,
+) -> None:
+    base = re.sub(r"\.pdf$", "", base_name, flags=re.IGNORECASE).strip()
+    base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or "Orders"
+    unmapped_dir = output_dir / "Unmapped Vendor Routes"
+
+    for vendor, data in vendor_pdfs.items():
+        safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+        filename = f"{base} - {safe_vendor}.pdf"
+
+        # Keep a local individual copy in retailer output.
+        local_vendor_file = output_dir / filename
+        local_vendor_file.write_bytes(data)
+
+        route_dir = resolve_route_path(routes, retailer, vendor)
+        if route_dir is None:
+            route_dir = unmapped_dir
+            logger.warning("[%s] No vendor route for '%s'; sent to %s", retailer, vendor, route_dir)
+
+        route_dir.mkdir(parents=True, exist_ok=True)
+        routed_file = route_dir / filename
+        shutil.copy2(local_vendor_file, routed_file)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Wait until a file is fully written (size-stability check)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,6 +431,7 @@ def process_pdf(
     crop_cfg: dict,
     output_dir: Path,
     review_dir: Path,
+    routes: dict[tuple[str, str], Path],
     logger: logging.Logger,
 ) -> None:
     logger.info("[%s] Processing: %s", retailer, pdf_path.name)
@@ -403,6 +514,7 @@ def process_pdf(
 
     out_zip.write_bytes(zip_bytes)
     df_report.to_csv(out_csv, index=False)
+    write_and_route_vendor_pdfs(vendor_pdfs, pdf_name, retailer, output_dir, routes, logger)
 
     flagged = df_report[df_report["Vendor"].isin(["REVIEW", "UNKNOWN", "MIXED/REVIEW"])].copy()
     review_count = int(flagged.shape[0])
@@ -426,12 +538,21 @@ def process_pdf(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PDFHandler(FileSystemEventHandler):
-    def __init__(self, retailer: str, crop_cfg: dict, output_dir: Path, review_dir: Path, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        retailer: str,
+        crop_cfg: dict,
+        output_dir: Path,
+        review_dir: Path,
+        routes: dict[tuple[str, str], Path],
+        logger: logging.Logger,
+    ) -> None:
         super().__init__()
         self.retailer  = retailer
         self.crop_cfg  = crop_cfg
         self.output_dir = output_dir
         self.review_dir = review_dir
+        self.routes = routes
         self.logger    = logger
         self._last_seen: dict[str, float] = {}
 
@@ -455,7 +576,7 @@ class PDFHandler(FileSystemEventHandler):
             return
 
         try:
-            process_pdf(path, self.retailer, self.crop_cfg, self.output_dir, self.review_dir, self.logger)
+            process_pdf(path, self.retailer, self.crop_cfg, self.output_dir, self.review_dir, self.routes, self.logger)
         except Exception as e:
             self.logger.exception(
                 "[%s] Unhandled error processing %s: %s", self.retailer, path.name, e
@@ -489,21 +610,23 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger = logging.getLogger("watcher")
+    routes = load_vendor_output_routes(ROUTES_XLSX_PATH, logger)
+    route_dirs = list({p for p in routes.values()})
 
-    if os.name != "nt" and any(str(p).startswith("\\\\") for p in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *REVIEW_DIRS.values()]):
+    if os.name != "nt" and any(str(p).startswith("\\\\") for p in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *REVIEW_DIRS.values(), *route_dirs]):
         logger.error("UNC paths were configured, but this host is not Windows.")
         logger.error("Run watcher.py on a Windows machine that can access the network share.")
         return
 
     # Ensure all directories exist
-    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *REVIEW_DIRS.values()]:
+    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *REVIEW_DIRS.values(), *route_dirs]:
         d.mkdir(parents=True, exist_ok=True)
 
     crop_cfg = load_crop_config()
 
     observer = Observer()
     for retailer, watch_dir in WATCH_DIRS.items():
-        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], REVIEW_DIRS[retailer], logger)
+        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], REVIEW_DIRS[retailer], routes, logger)
         observer.schedule(handler, str(watch_dir), recursive=False)
         logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
         logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
