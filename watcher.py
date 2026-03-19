@@ -42,7 +42,12 @@ WATCH_DIRS: dict[str, Path] = {
     "Lowe's":         Path(r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\2-Lowe's"),
     "Tractor Supply": Path(r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\3-Tractor Supply"),
 }
-OUTPUT_DIR = Path(r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output")
+OUTPUT_ROOT = Path(r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output")
+OUTPUT_DIRS: dict[str, Path] = {
+    "Home Depot":     OUTPUT_ROOT / "Depot",
+    "Lowe's":         OUTPUT_ROOT / "Lowe's",
+    "Tractor Supply": OUTPUT_ROOT / "Tractor Supply",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (mirrors app.py)
@@ -305,7 +310,7 @@ def _wait_for_file_ready(path: Path, stable_secs: float = 1.0, timeout_secs: flo
 # Main processing function
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process_pdf(pdf_path: Path, retailer: str, crop_cfg: dict, logger: logging.Logger) -> None:
+def process_pdf(pdf_path: Path, retailer: str, crop_cfg: dict, output_dir: Path, logger: logging.Logger) -> None:
     logger.info("[%s] Processing: %s", retailer, pdf_path.name)
 
     try:
@@ -381,8 +386,8 @@ def process_pdf(pdf_path: Path, retailer: str, crop_cfg: dict, logger: logging.L
 
     base         = re.sub(r"\.pdf$", "", pdf_name, flags=re.IGNORECASE).strip()
     retailer_slug = re.sub(r"[^\w]", "_", retailer)
-    out_zip      = OUTPUT_DIR / f"{base}_{retailer_slug}_VendorPdfs.zip"
-    out_csv      = OUTPUT_DIR / f"{base}_{retailer_slug}_Report.csv"
+    out_zip      = output_dir / f"{base}_{retailer_slug}_VendorPdfs.zip"
+    out_csv      = output_dir / f"{base}_{retailer_slug}_Report.csv"
 
     out_zip.write_bytes(zip_bytes)
     df_report.to_csv(out_csv, index=False)
@@ -401,10 +406,11 @@ def process_pdf(pdf_path: Path, retailer: str, crop_cfg: dict, logger: logging.L
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PDFHandler(FileSystemEventHandler):
-    def __init__(self, retailer: str, crop_cfg: dict, logger: logging.Logger) -> None:
+    def __init__(self, retailer: str, crop_cfg: dict, output_dir: Path, logger: logging.Logger) -> None:
         super().__init__()
         self.retailer  = retailer
         self.crop_cfg  = crop_cfg
+        self.output_dir = output_dir
         self.logger    = logger
         self._last_seen: dict[str, float] = {}
 
@@ -428,7 +434,7 @@ class PDFHandler(FileSystemEventHandler):
             return
 
         try:
-            process_pdf(path, self.retailer, self.crop_cfg, self.logger)
+            process_pdf(path, self.retailer, self.crop_cfg, self.output_dir, self.logger)
         except Exception as e:
             self.logger.exception(
                 "[%s] Unhandled error processing %s: %s", self.retailer, path.name, e
@@ -463,24 +469,24 @@ def main() -> None:
     )
     logger = logging.getLogger("watcher")
 
-    if os.name != "nt" and any(str(p).startswith("\\\\") for p in [*WATCH_DIRS.values(), OUTPUT_DIR]):
+    if os.name != "nt" and any(str(p).startswith("\\\\") for p in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values()]):
         logger.error("UNC paths were configured, but this host is not Windows.")
         logger.error("Run watcher.py on a Windows machine that can access the network share.")
         return
 
     # Ensure all directories exist
-    for d in [*WATCH_DIRS.values(), OUTPUT_DIR]:
+    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values()]:
         d.mkdir(parents=True, exist_ok=True)
 
     crop_cfg = load_crop_config()
 
     observer = Observer()
     for retailer, watch_dir in WATCH_DIRS.items():
-        handler = PDFHandler(retailer, crop_cfg, logger)
+        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], logger)
         observer.schedule(handler, str(watch_dir), recursive=False)
         logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
+        logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
 
-    logger.info("Output directory          → %s/", OUTPUT_DIR)
     logger.info("Watcher running. Drop PDF files into a watch folder. Press Ctrl+C to stop.\n")
 
     observer.start()
