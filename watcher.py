@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import time
 import zipfile as zf
 from collections import defaultdict
@@ -383,10 +382,6 @@ def write_and_route_vendor_pdfs(
         safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
         filename = f"{base} - {safe_vendor}.pdf"
 
-        # Keep a local individual copy in retailer output.
-        local_vendor_file = output_dir / filename
-        local_vendor_file.write_bytes(data)
-
         route_dir = resolve_route_path(routes, retailer, vendor)
         if route_dir is None:
             route_dir = unmapped_dir
@@ -394,7 +389,7 @@ def write_and_route_vendor_pdfs(
 
         route_dir.mkdir(parents=True, exist_ok=True)
         routed_file = route_dir / filename
-        shutil.copy2(local_vendor_file, routed_file)
+        routed_file.write_bytes(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
