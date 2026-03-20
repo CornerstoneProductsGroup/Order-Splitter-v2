@@ -7,7 +7,7 @@ import json
 import io
 from collections import defaultdict
 
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader
 import fitz  # PyMuPDF
 from PIL import Image, ImageDraw
 
@@ -490,23 +490,47 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: 
     return vendor_pdfs
 
 
-def build_warehouse_print_pdf(pdf_bytes: bytes, page_vendor_rows: list[dict], vendors: list[str]) -> bytes | None:
-    reader = PdfReader(BytesIO(pdf_bytes))
+def build_warehouse_print_pdf(pdf_bytes: bytes, page_vendor_rows: list[dict], vendors: list[str], retailer: str, crop_cfg: dict) -> bytes | None:
+    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_by_vendor = defaultdict(list)
+    row_by_page: dict[int, dict] = {}
     for r in page_vendor_rows:
         pages_by_vendor[r["Vendor"]].append(r["PageIndex"])
+        row_by_page[r["PageIndex"]] = r
 
     target = [v for v in vendors if v in pages_by_vendor]
     if not target:
+        src_doc.close()
         return None
 
-    writer = PdfWriter()
+    sos_crop = sos_crop_region_from_cfg(crop_cfg) if retailer == "Lowe's" else None
+    sos_page_w, sos_page_h = sos_output_size_points_from_cfg(crop_cfg) if retailer == "Lowe's" else (0.0, 0.0)
+    redact_regions = redact_regions_from_cfg(crop_cfg) if retailer == "Tractor Supply" else []
+
+    out_doc = fitz.open()
     for vendor in sorted(target, key=lambda x: x.lower()):
         for i in sorted(pages_by_vendor[vendor]):
-            writer.add_page(reader.pages[i])
+            row = row_by_page.get(i, {})
+            is_sos_page = sos_crop is not None and bool(row.get("SOS Tag", False))
+
+            if is_sos_page:
+                src_page = src_doc.load_page(i)
+                pix, _ = render_sos_clip_pixmap(src_page, sos_crop)
+                page = out_doc.new_page(width=sos_page_w, height=sos_page_h)
+                img_rect = fit_rect_contain(sos_page_w, sos_page_h, float(pix.width), float(pix.height))
+                page.insert_image(img_rect, pixmap=pix)
+            else:
+                out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
+                page = out_doc[-1]
+
+            if redact_regions:
+                for reg in redact_regions:
+                    page.draw_rect(region_to_rect(page, reg), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
 
     buf = BytesIO()
-    writer.write(buf)
+    out_doc.save(buf)
+    out_doc.close()
+    src_doc.close()
     return buf.getvalue()
 
 
@@ -744,7 +768,7 @@ with tab_split:
             for r in rows
         ]
         vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows, retailer, st.session_state["crop_cfg"])
-        warehouse_pdf = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
+        warehouse_pdf = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS, retailer, crop_cfg)
         zip_bytes = build_zip(vendor_pdfs, base_name=pdf_name, warehouse_print_pdf=warehouse_pdf)
         download_base = re.sub(r"\.pdf$", "", pdf_name, flags=re.IGNORECASE)
 
