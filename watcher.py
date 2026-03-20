@@ -88,7 +88,7 @@ CROP_CONFIG_DEFAULTS: dict[str, dict] = {
     },
     "Lowe's": {
         "extract_region": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
-        "sos_output_crop": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
+        "sos_output_crop": {"x0": 0.02, "x1": 0.50, "y0": 0.42, "y1": 0.98},
         "sos_output_size_in": {"width": 4.0, "height": 6.0},
     },
     "Tractor Supply": {
@@ -213,34 +213,44 @@ def _pixmap_nonwhite_ratio(pix: fitz.Pixmap) -> float:
     return (nonwhite / total) if total else 0.0
 
 
+def _auto_content_rect(page: fitz.Page, margin: float = 6.0) -> fitz.Rect | None:
+    """Return the bounding rect of all vector content (text + drawings) on the page.
+
+    This auto-detects where the label actually is so no manual coordinate
+    configuration is needed for Lowe's SOS pages.
+    """
+    bbox = fitz.Rect()  # starts empty/infinite
+    for block in page.get_text("blocks"):
+        bbox |= fitz.Rect(block[:4])
+    for draw in page.get_drawings():
+        r = draw.get("rect")
+        if r:
+            bbox |= fitz.Rect(r)
+    if bbox.is_empty or bbox.is_infinite:
+        return None
+    w, h = page.rect.width, page.rect.height
+    return fitz.Rect(
+        max(0.0, bbox.x0 - margin),
+        max(0.0, bbox.y0 - margin),
+        min(w, bbox.x1 + margin),
+        min(h, bbox.y1 + margin),
+    )
+
+
 def _render_sos_clip_pixmap(src_page: fitz.Page, region: dict) -> tuple[fitz.Pixmap, fitz.Rect]:
-    rect_rot = _region_to_rotated_rect(src_page, region)
-    rect_derot = _region_to_rect(src_page, region)
-
-    candidates: list[tuple[fitz.Rect, fitz.Pixmap]] = []
-
-    for rect in (rect_rot, rect_derot):
-        try:
-            candidates.append((rect, src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect, alpha=False)))
-        except Exception:
-            pass
-
-    # Try a padded clip as a second chance in case coordinate tuning is slightly off.
-    for rect in (rect_rot, rect_derot):
-        pad_x = max(6.0, rect.width * 0.12)
-        pad_y = max(6.0, rect.height * 0.12)
-        padded = fitz.Rect(rect.x0 - pad_x, rect.y0 - pad_y, rect.x1 + pad_x, rect.y1 + pad_y)
-        try:
-            candidates.append((padded, src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=padded, alpha=False)))
-        except Exception:
-            pass
-
-    if candidates:
-        best_rect, best_pix = max(candidates, key=lambda rp: _pixmap_nonwhite_ratio(rp[1]))
-        if _pixmap_nonwhite_ratio(best_pix) > 0.003:
-            return best_pix, best_rect
-
-    # Last resort: avoid blank output by returning full page content.
+    # Auto-detect the exact label bounds from the PDF's own vector content.
+    # This is reliable regardless of any picker-drawn coordinates.
+    clip = _auto_content_rect(src_page)
+    if clip is None:
+        # Fallback to the configured region if auto-detection finds nothing.
+        clip = _region_to_rotated_rect(src_page, region)
+    try:
+        pix = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip, alpha=False)
+        if _pixmap_nonwhite_ratio(pix) > 0.003:
+            return pix, clip
+    except Exception:
+        pass
+    # Last resort: full page.
     full = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
     return full, src_page.rect
 
