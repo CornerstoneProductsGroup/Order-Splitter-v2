@@ -49,6 +49,7 @@ CROP_CONFIG_DEFAULTS = {
     "Lowe's": {
         "extract_region": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
         "sos_output_crop": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
+        "sos_output_size_in": {"width": 4.0, "height": 6.0},
     },
     "Tractor Supply": {
         "extract_region": {"x0": 0.14, "x1": 0.30, "y0": 0.20, "y1": 0.55},
@@ -101,6 +102,13 @@ def merge_retailer_config(retailer: str, raw: dict | None) -> dict:
             section.get("sos_output_crop"),
             default_region(retailer, "sos_output_crop"),
         )
+        size_raw = section.get("sos_output_size_in", CROP_CONFIG_DEFAULTS[retailer].get("sos_output_size_in", {}))
+        if isinstance(size_raw, dict):
+            w = float(size_raw.get("width", 4.0))
+            h = float(size_raw.get("height", 6.0))
+        else:
+            w, h = 4.0, 6.0
+        merged["sos_output_size_in"] = {"width": max(1.0, w), "height": max(1.0, h)}
     elif retailer == "Tractor Supply":
         regs = section.get("redact_regions", CROP_CONFIG_DEFAULTS[retailer].get("redact_regions", []))
         merged["redact_regions"] = [normalize_region(r) for r in regs if isinstance(r, dict)]
@@ -118,6 +126,14 @@ def sos_crop_region_from_cfg(crop_cfg: dict) -> dict | None:
 
 def redact_regions_from_cfg(crop_cfg: dict) -> list[dict]:
     return merge_retailer_config("Tractor Supply", crop_cfg.get("Tractor Supply")).get("redact_regions", [])
+
+
+def sos_output_size_points_from_cfg(crop_cfg: dict) -> tuple[float, float]:
+    cfg = merge_retailer_config("Lowe's", crop_cfg.get("Lowe's"))
+    size = cfg.get("sos_output_size_in", {"width": 4.0, "height": 6.0})
+    w_in = float(size.get("width", 4.0))
+    h_in = float(size.get("height", 6.0))
+    return (w_in * 72.0, h_in * 72.0)
 
 
 def region_to_rect(page: fitz.Page, region: dict) -> fitz.Rect:
@@ -183,6 +199,17 @@ def render_sos_clip_pixmap(src_page: fitz.Page, region: dict) -> tuple[fitz.Pixm
 
     full = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
     return full, src_page.rect
+
+
+def fit_rect_contain(dst_w: float, dst_h: float, src_w: float, src_h: float) -> fitz.Rect:
+    if src_w <= 0 or src_h <= 0:
+        return fitz.Rect(0, 0, dst_w, dst_h)
+    scale = min(dst_w / src_w, dst_h / src_h)
+    w = src_w * scale
+    h = src_h * scale
+    x0 = (dst_w - w) / 2.0
+    y0 = (dst_h - h) / 2.0
+    return fitz.Rect(x0, y0, x0 + w, y0 + h)
 
 
 # -----------------------------
@@ -410,6 +437,7 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: 
         row_by_page[r["PageIndex"]] = r
 
     sos_crop = sos_crop_region_from_cfg(crop_cfg) if retailer == "Lowe's" else None
+    sos_page_w, sos_page_h = sos_output_size_points_from_cfg(crop_cfg) if retailer == "Lowe's" else (0.0, 0.0)
     redact_regions = redact_regions_from_cfg(crop_cfg) if retailer == "Tractor Supply" else []
 
     vendor_pdfs = {}
@@ -422,8 +450,9 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: 
             if is_sos_page:
                 src_page = src_doc.load_page(i)
                 pix, clip_rect = render_sos_clip_pixmap(src_page, sos_crop)
-                page = out_doc.new_page(width=clip_rect.width, height=clip_rect.height)
-                page.insert_image(page.rect, pixmap=pix)
+                page = out_doc.new_page(width=sos_page_w, height=sos_page_h)
+                img_rect = fit_rect_contain(sos_page_w, sos_page_h, float(pix.width), float(pix.height))
+                page.insert_image(img_rect, pixmap=pix)
             else:
                 out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
                 page = out_doc[-1]
