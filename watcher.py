@@ -120,41 +120,46 @@ def _normalize_region(region: dict | None, fallback: dict | None = None) -> dict
     return {"x0": x0f, "x1": x1f, "y0": y0f, "y1": y1f}
 
 
+def _default_region(retailer: str, key: str) -> dict:
+    section = CROP_CONFIG_DEFAULTS.get(retailer, {})
+    raw = section.get(key, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
+    return _normalize_region(raw)
+
+
+def _merge_retailer_config(retailer: str, raw: dict | None) -> dict:
+    section = raw if isinstance(raw, dict) else {}
+    merged: dict = {}
+
+    if all(k in section for k in ("x0", "x1", "y0", "y1")):
+        merged["extract_region"] = _normalize_region(section)
+    else:
+        merged["extract_region"] = _normalize_region(
+            section.get("extract_region"),
+            _default_region(retailer, "extract_region"),
+        )
+
+    if retailer == "Lowe's":
+        merged["sos_output_crop"] = _normalize_region(
+            section.get("sos_output_crop"),
+            _default_region(retailer, "sos_output_crop"),
+        )
+    elif retailer == "Tractor Supply":
+        regs = section.get("redact_regions", CROP_CONFIG_DEFAULTS[retailer].get("redact_regions", []))
+        merged["redact_regions"] = [_normalize_region(r) for r in regs if isinstance(r, dict)]
+
+    return merged
+
+
 def _extract_region_from_cfg(retailer: str, crop_cfg: dict) -> dict:
-    raw = crop_cfg.get(retailer, {})
-    if not isinstance(raw, dict):
-        return {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0}
-
-    # Backward compatible: legacy config had x0/x1/y0/y1 at the retailer root.
-    if all(k in raw for k in ("x0", "x1", "y0", "y1")):
-        return _normalize_region(raw)
-
-    return _normalize_region(raw.get("extract_region"))
+    return _merge_retailer_config(retailer, crop_cfg.get(retailer)).get("extract_region", {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
 
 
 def _sos_crop_region_from_cfg(crop_cfg: dict) -> dict | None:
-    raw = crop_cfg.get("Lowe's", {})
-    if not isinstance(raw, dict):
-        return None
-    region = raw.get("sos_output_crop")
-    if not isinstance(region, dict):
-        return None
-    return _normalize_region(region)
+    return _merge_retailer_config("Lowe's", crop_cfg.get("Lowe's")).get("sos_output_crop")
 
 
 def _redact_regions_from_cfg(crop_cfg: dict) -> list[dict]:
-    raw = crop_cfg.get("Tractor Supply", {})
-    if not isinstance(raw, dict):
-        return []
-    regions = raw.get("redact_regions", [])
-    if not isinstance(regions, list):
-        return []
-
-    cleaned: list[dict] = []
-    for reg in regions:
-        if isinstance(reg, dict):
-            cleaned.append(_normalize_region(reg))
-    return cleaned
+    return _merge_retailer_config("Tractor Supply", crop_cfg.get("Tractor Supply")).get("redact_regions", [])
 
 
 def _region_to_rect(page: fitz.Page, region: dict) -> fitz.Rect:
@@ -260,12 +265,10 @@ def load_crop_config() -> dict:
             with open(CROP_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                for r, d in CROP_CONFIG_DEFAULTS.items():
-                    data.setdefault(r, d)
-                return data
+                return {r: _merge_retailer_config(r, data.get(r)) for r in CROP_CONFIG_DEFAULTS}
     except Exception:
         pass
-    return dict(CROP_CONFIG_DEFAULTS)
+    return {r: _merge_retailer_config(r, None) for r in CROP_CONFIG_DEFAULTS}
 
 
 def load_vendor_map(retailer: str) -> pd.DataFrame:
@@ -394,17 +397,21 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: 
     for vendor, idxs in pages_by_vendor.items():
         out_doc = fitz.open()
         for i in idxs:
-            out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
-            page = out_doc[-1]
             row = row_by_page.get(i, {})
+            is_sos_page = sos_crop is not None and bool(row.get("SOS Tag", False))
 
-            if sos_crop is not None and bool(row.get("SOS Tag", False)):
-                page.set_cropbox(_region_to_rect(page, sos_crop))
+            if is_sos_page:
+                src_page = src_doc.load_page(i)
+                clip_rect = _region_to_rect(src_page, sos_crop)
+                page = out_doc.new_page(width=clip_rect.width, height=clip_rect.height)
+                page.show_pdf_page(page.rect, src_doc, i, clip=clip_rect)
+            else:
+                out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
+                page = out_doc[-1]
 
             if redact_regions:
                 for reg in redact_regions:
-                    page.add_redact_annot(_region_to_rect(page, reg), fill=(1, 1, 1))
-                page.apply_redactions()
+                    page.draw_rect(_region_to_rect(page, reg), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
 
         buf = BytesIO()
         out_doc.save(buf)

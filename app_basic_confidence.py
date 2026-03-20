@@ -43,10 +43,69 @@ CROP_CONFIG_PATH = "crop_config.json"
 
 # 🔒 Locked defaults (your tuned values)
 CROP_CONFIG_DEFAULTS = {
-    "Home Depot": {"x0": 0.02, "x1": 0.14, "y0": 0.26, "y1": 0.54},
-    "Lowe's": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
-    "Tractor Supply": {"x0": 0.14, "x1": 0.30, "y0": 0.20, "y1": 0.55},
+    "Home Depot": {
+        "extract_region": {"x0": 0.02, "x1": 0.14, "y0": 0.26, "y1": 0.54},
+    },
+    "Lowe's": {
+        "extract_region": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
+        "sos_output_crop": {"x0": 0.52, "x1": 0.79, "y0": 0.25, "y1": 0.67},
+    },
+    "Tractor Supply": {
+        "extract_region": {"x0": 0.14, "x1": 0.30, "y0": 0.20, "y1": 0.55},
+        "redact_regions": [],
+    },
 }
+
+
+def normalize_region(region: dict | None, fallback: dict | None = None) -> dict:
+    base = fallback or {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0}
+    src = region or {}
+    x0f = float(src.get("x0", base.get("x0", 0.0)))
+    x1f = float(src.get("x1", base.get("x1", 1.0)))
+    y0f = float(src.get("y0", base.get("y0", 0.0)))
+    y1f = float(src.get("y1", base.get("y1", 1.0)))
+
+    x0f = max(0.0, min(1.0, x0f))
+    x1f = max(0.0, min(1.0, x1f))
+    y0f = max(0.0, min(1.0, y0f))
+    y1f = max(0.0, min(1.0, y1f))
+
+    if x1f < x0f:
+        x0f, x1f = x1f, x0f
+    if y1f < y0f:
+        y0f, y1f = y1f, y0f
+
+    return {"x0": x0f, "x1": x1f, "y0": y0f, "y1": y1f}
+
+
+def default_region(retailer: str, key: str) -> dict:
+    section = CROP_CONFIG_DEFAULTS.get(retailer, {})
+    raw = section.get(key, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
+    return normalize_region(raw)
+
+
+def merge_retailer_config(retailer: str, raw: dict | None) -> dict:
+    section = raw if isinstance(raw, dict) else {}
+    merged: dict = {}
+
+    if all(k in section for k in ("x0", "x1", "y0", "y1")):
+        merged["extract_region"] = normalize_region(section)
+    else:
+        merged["extract_region"] = normalize_region(
+            section.get("extract_region"),
+            default_region(retailer, "extract_region"),
+        )
+
+    if retailer == "Lowe's":
+        merged["sos_output_crop"] = normalize_region(
+            section.get("sos_output_crop"),
+            default_region(retailer, "sos_output_crop"),
+        )
+    elif retailer == "Tractor Supply":
+        regs = section.get("redact_regions", CROP_CONFIG_DEFAULTS[retailer].get("redact_regions", []))
+        merged["redact_regions"] = [normalize_region(r) for r in regs if isinstance(r, dict)]
+
+    return merged
 
 
 # -----------------------------
@@ -128,12 +187,10 @@ def load_crop_config() -> dict:
             with open(CROP_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                for r, d in CROP_CONFIG_DEFAULTS.items():
-                    data.setdefault(r, d)
-                return data
+                return {r: merge_retailer_config(r, data.get(r)) for r in CROP_CONFIG_DEFAULTS}
     except Exception:
         pass
-    return dict(CROP_CONFIG_DEFAULTS)
+    return {r: merge_retailer_config(r, None) for r in CROP_CONFIG_DEFAULTS}
 
 
 def save_crop_config(cfg: dict) -> bool:
@@ -348,7 +405,7 @@ with tab_tune:
 
     t_retailer = st.selectbox("Retailer", ["Home Depot", "Lowe's", "Tractor Supply"], key="tune_retailer")
     cfg = st.session_state["crop_cfg"]
-    cur = cfg.get(t_retailer, CROP_CONFIG_DEFAULTS[t_retailer])
+    cur = merge_retailer_config(t_retailer, cfg.get(t_retailer)).get("extract_region")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -364,7 +421,8 @@ with tab_tune:
     if y1 < y0:
         y0, y1 = y1, y0
 
-    cfg[t_retailer] = {"x0": float(x0), "x1": float(x1), "y0": float(y0), "y1": float(y1)}
+    cfg.setdefault(t_retailer, {})
+    cfg[t_retailer]["extract_region"] = {"x0": float(x0), "x1": float(x1), "y0": float(y0), "y1": float(y1)}
     st.session_state["crop_cfg"] = cfg
 
     pdf_prev = st.file_uploader("Upload a PDF to preview", type=["pdf"], key="tune_pdf")
@@ -393,7 +451,7 @@ with tab_tune:
             st.warning("Upload a PDF first.")
         else:
             try:
-                img = render_scan_area_overlay(pdf_prev.getvalue(), int(page_prev) - 1, cfg[t_retailer], zoom=2.0)
+                img = render_scan_area_overlay(pdf_prev.getvalue(), int(page_prev) - 1, merge_retailer_config(t_retailer, cfg.get(t_retailer)).get("extract_region"), zoom=2.0)
                 st.image(img, caption=f"{t_retailer} scan area preview (page {int(page_prev)})", use_container_width=True)
             except Exception as e:
                 st.error(f"Preview failed: {e}")
@@ -530,10 +588,11 @@ with tab_split:
         vendor_pdfs = build_vendor_pdfs(pdf_bytes, page_vendor_rows)
         warehouse_pdf = build_warehouse_print_pdf(pdf_bytes, page_vendor_rows, WAREHOUSE_VENDORS)
         zip_bytes = build_zip(vendor_pdfs, base_name=pdf_name, warehouse_print_pdf=warehouse_pdf)
+        download_base = re.sub(r"\.pdf$", "", pdf_name, flags=re.IGNORECASE)
 
         st.subheader("Downloads")
-        st.download_button("Download Vendor ZIP", data=zip_bytes, file_name=f"{re.sub(r'\\.pdf$','',pdf_name)}_VendorPdfs.zip", mime="application/zip")
-        st.download_button("Download Report CSV", data=df_report.to_csv(index=False).encode("utf-8"), file_name=f"{re.sub(r'\\.pdf$','',pdf_name)}_Report.csv", mime="text/csv")
+        st.download_button("Download Vendor ZIP", data=zip_bytes, file_name=f"{download_base}_VendorPdfs.zip", mime="application/zip")
+        st.download_button("Download Report CSV", data=df_report.to_csv(index=False).encode("utf-8"), file_name=f"{download_base}_Report.csv", mime="text/csv")
 
         st.divider()
         st.subheader("Fix / Override Page Assignments (always available)")
@@ -587,7 +646,7 @@ with tab_split:
 
         # Preview selected page with scan box
         try:
-            rect = st.session_state["crop_cfg"].get(retailer, CROP_CONFIG_DEFAULTS[retailer])
+            rect = merge_retailer_config(retailer, st.session_state["crop_cfg"].get(retailer)).get("extract_region")
             preview_png = render_scan_area_overlay(pdf_bytes, int(sel_page) - 1, rect, zoom=2.0)
             st.image(preview_png, caption=f"Preview of page {int(sel_page)} with scan box (red)", use_container_width=True)
         except Exception:

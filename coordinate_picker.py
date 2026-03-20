@@ -37,17 +37,43 @@ def normalize_region(region: dict) -> dict:
     return {"x0": x0, "x1": x1, "y0": y0, "y1": y1}
 
 
+def default_region(retailer: str, key: str) -> dict:
+    section = CROP_CONFIG_DEFAULTS.get(retailer, {})
+    raw = section.get(key, {"x0": 0.0, "x1": 1.0, "y0": 0.0, "y1": 1.0})
+    return normalize_region(raw)
+
+
+def merge_retailer_config(retailer: str, raw: dict | None) -> dict:
+    section = raw if isinstance(raw, dict) else {}
+    merged: dict = {}
+
+    if all(k in section for k in ("x0", "x1", "y0", "y1")):
+        merged["extract_region"] = normalize_region(section)
+    else:
+        merged["extract_region"] = normalize_region(
+            section.get("extract_region", default_region(retailer, "extract_region"))
+        )
+
+    if retailer == "Lowe's":
+        merged["sos_output_crop"] = normalize_region(
+            section.get("sos_output_crop", default_region(retailer, "sos_output_crop"))
+        )
+    elif retailer == "Tractor Supply":
+        regs = section.get("redact_regions", CROP_CONFIG_DEFAULTS[retailer].get("redact_regions", []))
+        merged["redact_regions"] = [normalize_region(r) for r in regs if isinstance(r, dict)]
+
+    return merged
+
+
 def load_config(path: Path) -> dict:
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                for retailer, defaults in CROP_CONFIG_DEFAULTS.items():
-                    data.setdefault(retailer, defaults.copy())
-                return data
+                return {retailer: merge_retailer_config(retailer, data.get(retailer)) for retailer in CROP_CONFIG_DEFAULTS}
         except Exception:
             pass
-    return json.loads(json.dumps(CROP_CONFIG_DEFAULTS))
+    return {retailer: merge_retailer_config(retailer, None) for retailer in CROP_CONFIG_DEFAULTS}
 
 
 class PickerApp:
