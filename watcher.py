@@ -172,6 +172,16 @@ def _region_to_rect(page: fitz.Page, region: dict) -> fitz.Rect:
     rect_rot = fitz.Rect(left, top, right, bottom)
     return rect_rot * page.derotation_matrix
 
+
+def _region_to_rotated_rect(page: fitz.Page, region: dict) -> fitz.Rect:
+    w = page.rect.width
+    h = page.rect.height
+    left = region["x0"] * w
+    right = region["x1"] * w
+    top = (1 - region["y1"]) * h
+    bottom = (1 - region["y0"]) * h
+    return fitz.Rect(left, top, right, bottom)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core processing helpers  (exact copies of the logic in app.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,9 +412,10 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: 
 
             if is_sos_page:
                 src_page = src_doc.load_page(i)
-                clip_rect = _region_to_rect(src_page, sos_crop)
+                clip_rect = _region_to_rotated_rect(src_page, sos_crop)
+                pix = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip_rect, alpha=False)
                 page = out_doc.new_page(width=clip_rect.width, height=clip_rect.height)
-                page.show_pdf_page(page.rect, src_doc, i, clip=clip_rect)
+                page.insert_image(page.rect, pixmap=pix)
             else:
                 out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
                 page = out_doc[-1]
