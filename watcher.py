@@ -182,6 +182,32 @@ def _region_to_rotated_rect(page: fitz.Page, region: dict) -> fitz.Rect:
     bottom = (1 - region["y0"]) * h
     return fitz.Rect(left, top, right, bottom)
 
+
+def _pixmap_nonwhite_ratio(pix: fitz.Pixmap) -> float:
+    if pix.alpha:
+        px = fitz.Pixmap(fitz.csRGB, pix)
+    else:
+        px = pix
+    data = px.samples
+    nonwhite = 0
+    total = px.width * px.height
+    for i in range(0, len(data), px.n):
+        if not (data[i] > 245 and data[i + 1] > 245 and data[i + 2] > 245):
+            nonwhite += 1
+    return (nonwhite / total) if total else 0.0
+
+
+def _render_sos_clip_pixmap(src_page: fitz.Page, region: dict) -> tuple[fitz.Pixmap, fitz.Rect]:
+    rect_rot = _region_to_rotated_rect(src_page, region)
+    rect_derot = _region_to_rect(src_page, region)
+
+    pix_rot = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect_rot, alpha=False)
+    pix_derot = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect_derot, alpha=False)
+
+    if _pixmap_nonwhite_ratio(pix_derot) > _pixmap_nonwhite_ratio(pix_rot):
+        return pix_derot, rect_derot
+    return pix_rot, rect_rot
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core processing helpers  (exact copies of the logic in app.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,8 +438,7 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: 
 
             if is_sos_page:
                 src_page = src_doc.load_page(i)
-                clip_rect = _region_to_rotated_rect(src_page, sos_crop)
-                pix = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip_rect, alpha=False)
+                pix, clip_rect = _render_sos_clip_pixmap(src_page, sos_crop)
                 page = out_doc.new_page(width=clip_rect.width, height=clip_rect.height)
                 page.insert_image(page.rect, pixmap=pix)
             else:
