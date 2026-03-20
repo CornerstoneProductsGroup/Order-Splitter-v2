@@ -226,14 +226,23 @@ def _auto_content_rect(page: fitz.Page, margin: float = 6.0) -> fitz.Rect | None
         r = draw.get("rect")
         if r:
             bbox |= fitz.Rect(r)
+    # Some barcodes are embedded as images. Include their rectangles too.
+    try:
+        for img in page.get_images(full=True):
+            xref = img[0]
+            for r in page.get_image_rects(xref):
+                bbox |= fitz.Rect(r)
+    except Exception:
+        pass
     if bbox.is_empty or bbox.is_infinite:
         return None
     w, h = page.rect.width, page.rect.height
+    bottom_margin = max(18.0, margin * 3.0)
     return fitz.Rect(
         max(0.0, bbox.x0 - margin),
         max(0.0, bbox.y0 - margin),
         min(w, bbox.x1 + margin),
-        min(h, bbox.y1 + margin),
+        min(h, bbox.y1 + bottom_margin),
     )
 
 
