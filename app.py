@@ -159,12 +159,30 @@ def render_sos_clip_pixmap(src_page: fitz.Page, region: dict) -> tuple[fitz.Pixm
     rect_rot = region_to_rotated_rect(src_page, region)
     rect_derot = region_to_rect(src_page, region)
 
-    pix_rot = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect_rot, alpha=False)
-    pix_derot = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect_derot, alpha=False)
+    candidates: list[tuple[fitz.Rect, fitz.Pixmap]] = []
 
-    if pixmap_nonwhite_ratio(pix_derot) > pixmap_nonwhite_ratio(pix_rot):
-        return pix_derot, rect_derot
-    return pix_rot, rect_rot
+    for rect in (rect_rot, rect_derot):
+        try:
+            candidates.append((rect, src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect, alpha=False)))
+        except Exception:
+            pass
+
+    for rect in (rect_rot, rect_derot):
+        pad_x = max(6.0, rect.width * 0.12)
+        pad_y = max(6.0, rect.height * 0.12)
+        padded = fitz.Rect(rect.x0 - pad_x, rect.y0 - pad_y, rect.x1 + pad_x, rect.y1 + pad_y)
+        try:
+            candidates.append((padded, src_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=padded, alpha=False)))
+        except Exception:
+            pass
+
+    if candidates:
+        best_rect, best_pix = max(candidates, key=lambda rp: pixmap_nonwhite_ratio(rp[1]))
+        if pixmap_nonwhite_ratio(best_pix) > 0.003:
+            return best_pix, best_rect
+
+    full = src_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    return full, src_page.rect
 
 
 # -----------------------------
@@ -608,6 +626,10 @@ with tab_split:
             # For Lowe's: also only use scan-area for matching (SOS detection handled above).
             scan_text = (region or "").strip()
 
+            if retailer == "Lowe's":
+                if not scan_text or len(scan_text) < 8:
+                    scan_text = (full or "").strip()
+
             if not scan_text:
                 if fallback_full:
                     scan_text = (full or "").strip()
@@ -623,6 +645,11 @@ with tab_split:
                     continue
 
             vendor, matched, conf = match_vendor(scan_text, lookup)
+
+            if retailer == "Lowe's" and vendor in ("UNKNOWN", "MIXED/REVIEW"):
+                fallback_vendor, fallback_matched, fallback_conf = match_vendor((full or "").strip(), lookup)
+                if fallback_vendor not in ("UNKNOWN", "MIXED/REVIEW"):
+                    vendor, matched, conf = fallback_vendor, fallback_matched, fallback_conf
 
             final_vendor = vendor
             if conf < confidence_threshold and vendor not in ("UNKNOWN", "MIXED/REVIEW"):
