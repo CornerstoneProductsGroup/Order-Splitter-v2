@@ -9,8 +9,16 @@ Watch folders (created automatically on first run):
 Output is written to:
   ./watch/output/
 
-Run:
+Vendor PDFs are also staged daily for email dispatch in:
+  ./email_staging/{YYYY-MM-DD}/{VendorName}/
+
+Run the watcher:
   python watcher.py
+
+Send today's vendor emails (Outlook must be open on this machine):
+  python send_emails.py
+  python send_emails.py --send        # actually send (default is draft mode)
+  python send_emails.py --date 2026-03-20  # send a specific past date
 
 Stop:
   Ctrl+C
@@ -23,6 +31,7 @@ import os
 import re
 import shutil
 import time
+import datetime
 import zipfile as zf
 from collections import defaultdict
 from io import BytesIO
@@ -53,6 +62,11 @@ OUTPUT_DIRS: dict[str, Path] = {
 ROUTES_XLSX_PATH = Path("Vendor Output Routes.xlsx")
 ROUTES_REQUIRED_COLS = ["Retailer", "Vendor"]
 ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
+
+# Daily staging folder for vendor email attachments.
+# Vendor PDFs accumulate here across all retailer runs so one combined
+# email per vendor can be sent at end of day via send_emails.py.
+EMAIL_STAGING_ROOT = Path("email_staging")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (mirrors app.py)
@@ -632,6 +646,10 @@ def write_and_route_vendor_pdfs(
         routed_file = route_dir / filename
         routed_file.write_bytes(data)
 
+    # Copy vendor PDFs into the daily email staging folder so send_emails.py
+    # can combine all retailers into one email per vendor at end of day.
+    _stage_vendor_pdfs_for_email(vendor_pdfs, base, retailer, logger)
+
 
 def _remove_existing_routed_files_for_base(
     base: str,
@@ -667,6 +685,32 @@ def _clear_directory_contents(dir_path: Path, logger: logging.Logger, label: str
                 child.unlink()
         except OSError as e:
             logger.warning("[%s] Could not clear %s item %s: %s", label, dir_path, child, e)
+
+
+def _stage_vendor_pdfs_for_email(
+    vendor_pdfs: dict[str, bytes],
+    base: str,
+    retailer: str,
+    logger: logging.Logger,
+) -> None:
+    """Write vendor PDFs to the daily email staging folder.
+
+    Layout:  email_staging/{YYYY-MM-DD}/{VendorName}/{base} - {retailer} orders.pdf
+    The send_emails.py script reads this folder to build one email per vendor
+    with all retailers' attachments combined.
+    """
+    today = datetime.date.today().isoformat()   # e.g. "2026-03-20"
+    retailer_slug = re.sub(r"[^\w]", "_", retailer)
+
+    for vendor, data in vendor_pdfs.items():
+        safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+        vendor_dir = EMAIL_STAGING_ROOT / today / safe_vendor
+        try:
+            vendor_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{base} - {retailer_slug}.pdf"
+            (vendor_dir / filename).write_bytes(data)
+        except OSError as e:
+            logger.warning("[%s] Could not stage email PDF for vendor '%s': %s", retailer, vendor, e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

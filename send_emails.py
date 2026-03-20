@@ -1,0 +1,350 @@
+"""
+Send daily vendor order emails via Outlook (Windows only).
+
+For each vendor that has files in today's email staging folder, this script
+creates one Outlook email with ALL of that vendor's PDFs attached — regardless
+of which retailer (Depot, Lowe's, Tractor Supply) generated them.
+
+Vendor email addresses are read from vendor_email_contacts.xlsx.
+
+Usage
+-----
+  # Save to Drafts for review (safe default):
+  python send_emails.py
+
+  # Actually send immediately:
+  python send_emails.py --send
+
+  # Send files from a specific date instead of today:
+  python send_emails.py --date 2026-03-20
+
+  # Preview what would be sent without touching Outlook:
+  python send_emails.py --dry-run
+
+Contact spreadsheet (vendor_email_contacts.xlsx)
+-------------------------------------------------
+Required columns:
+  Vendor   – must match the vendor name exactly as it appears in the vendor maps
+  Email    – primary To address (required; separate multiple with semicolons)
+Optional columns:
+  CC       – CC address(es), semicolon-separated
+  BCC      – BCC address(es), semicolon-separated
+  Subject  – custom subject line (leave blank to use the default)
+  Body     – custom plain-text body (leave blank to use the default)
+
+Any vendor in the staging folder that has NO row in this file will be skipped
+and listed in the summary at the end.
+"""
+
+import argparse
+import datetime
+import logging
+import re
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+EMAIL_STAGING_ROOT = Path("email_staging")
+CONTACTS_XLSX      = Path("vendor_email_contacts.xlsx")
+
+FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
+DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
+DEFAULT_BODY_TEMPLATE = (
+    "Hi,\n\n"
+    "Please find attached your current packing slip order(s) for {date}.\n\n"
+    "Retailers included in this email:\n{retailers}\n\n"
+    "Thank you,\n{from_name}"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("send_emails")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Contact list loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_contacts(xlsx_path: Path) -> dict[str, dict]:
+    """Return {vendor_name: {email, cc, bcc, subject, body}} from the xlsx."""
+    if not xlsx_path.exists():
+        logger.error("Contact file not found: %s", xlsx_path)
+        return {}
+    try:
+        df = pd.read_excel(xlsx_path, dtype=str).fillna("")
+    except Exception as e:
+        logger.error("Could not read %s: %s", xlsx_path, e)
+        return {}
+
+    # Normalise column names
+    df.columns = [c.strip() for c in df.columns]
+
+    required = {"Vendor", "Email"}
+    missing = required - set(df.columns)
+    if missing:
+        logger.error("Contact file is missing columns: %s", missing)
+        return {}
+
+    contacts: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        vendor = str(row.get("Vendor", "")).strip()
+        email  = str(row.get("Email",  "")).strip()
+        if not vendor or not email:
+            continue
+        contacts[vendor] = {
+            "email":   email,
+            "cc":      str(row.get("CC",      "")).strip(),
+            "bcc":     str(row.get("BCC",     "")).strip(),
+            "subject": str(row.get("Subject", "")).strip(),
+            "body":    str(row.get("Body",    "")).strip(),
+        }
+    logger.info("Loaded %d vendor contacts from %s", len(contacts), xlsx_path)
+    return contacts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Staging folder scanner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scan_staging(date_str: str) -> dict[str, list[Path]]:
+    """Return {vendor_folder_name: [pdf_paths]} for the given date."""
+    day_dir = EMAIL_STAGING_ROOT / date_str
+    if not day_dir.exists():
+        logger.warning("No staging folder found for %s (%s)", date_str, day_dir)
+        return {}
+
+    result: dict[str, list[Path]] = {}
+    for vendor_dir in sorted(day_dir.iterdir()):
+        if not vendor_dir.is_dir():
+            continue
+        pdfs = sorted(vendor_dir.glob("*.pdf"))
+        if pdfs:
+            result[vendor_dir.name] = pdfs
+
+    logger.info("Found %d vendor(s) with staged PDFs for %s", len(result), date_str)
+    return result
+
+
+def _folder_name_to_vendor(folder_name: str, contacts: dict[str, dict]) -> str | None:
+    """Try to match a staging folder name back to a contact vendor name.
+
+    The staging folder name is the safe (filesystem-sanitised) version of the
+    vendor name.  We try an exact match first, then a normalise-and-compare.
+    """
+    if folder_name in contacts:
+        return folder_name
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^\w]", "", s).lower()
+
+    norm_folder = _norm(folder_name)
+    for vendor in contacts:
+        if _norm(vendor) == norm_folder:
+            return vendor
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outlook email creation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_retailer_list(pdfs: list[Path]) -> str:
+    """Extract retailer names from PDF file names like 'Base - Home_Depot.pdf'."""
+    retailers: list[str] = []
+    for p in pdfs:
+        # Filename pattern written by watcher: "{base} - {retailer_slug}.pdf"
+        stem = p.stem
+        parts = stem.rsplit(" - ", 1)
+        if len(parts) == 2:
+            retailer = parts[1].replace("_", " ").title()
+            if retailer not in retailers:
+                retailers.append(retailer)
+    return "\n".join(f"  • {r}" for r in retailers) if retailers else "  • See attached"
+
+
+def create_outlook_email(
+    vendor: str,
+    contact: dict,
+    pdfs: list[Path],
+    date_str: str,
+    draft_only: bool,
+    dry_run: bool,
+) -> bool:
+    """Create (and optionally send) one Outlook email for a vendor.
+
+    Returns True on success, False on failure.
+    """
+    formatted_date = datetime.date.fromisoformat(date_str).strftime("%B %d, %Y")
+    retailer_list  = _build_retailer_list(pdfs)
+
+    subject = contact["subject"] or DEFAULT_SUBJECT_TEMPLATE.format(
+        vendor=vendor, date=formatted_date
+    )
+    body = contact["body"] or DEFAULT_BODY_TEMPLATE.format(
+        vendor=vendor,
+        date=formatted_date,
+        retailers=retailer_list,
+        from_name=FROM_NAME,
+    )
+
+    if dry_run:
+        mode = "DRAFT" if draft_only else "SEND"
+        logger.info(
+            "[DRY-RUN] Would %s to %s (%s): %d attachment(s) — %s",
+            mode, vendor, contact["email"], len(pdfs),
+            ", ".join(p.name for p in pdfs),
+        )
+        return True
+
+    try:
+        import win32com.client as win32  # type: ignore[import]
+    except ImportError:
+        logger.error(
+            "pywin32 is not installed. Run:  pip install pywin32\n"
+            "This script must be run on a Windows machine with Outlook installed."
+        )
+        return False
+
+    try:
+        outlook = win32.Dispatch("Outlook.Application")
+        mail    = outlook.CreateItem(0)   # 0 = olMailItem
+
+        mail.Subject = subject
+        mail.To      = contact["email"]
+        if contact["cc"]:
+            mail.CC = contact["cc"]
+        if contact["bcc"]:
+            mail.BCC = contact["bcc"]
+        mail.Body = body
+
+        missing: list[str] = []
+        for pdf in pdfs:
+            resolved = pdf.resolve()
+            if resolved.exists():
+                mail.Attachments.Add(str(resolved))
+            else:
+                missing.append(pdf.name)
+                logger.warning("[%s] Attachment not found: %s", vendor, pdf)
+
+        if missing:
+            mail.Body += (
+                f"\n\n[Note: {len(missing)} file(s) could not be attached: "
+                + ", ".join(missing)
+                + "]"
+            )
+
+        if draft_only:
+            mail.Save()
+            logger.info(
+                "[DRAFT] Saved draft for %s (%s): %d attachment(s)",
+                vendor, contact["email"], len(pdfs),
+            )
+        else:
+            mail.Send()
+            logger.info(
+                "[SENT] Emailed %s (%s): %d attachment(s) — %s",
+                vendor, contact["email"], len(pdfs),
+                ", ".join(p.name for p in pdfs),
+            )
+
+        return True
+
+    except Exception as e:
+        logger.error("[%s] Outlook error: %s", vendor, e)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Send daily vendor order emails via Outlook."
+    )
+    parser.add_argument(
+        "--send",
+        action="store_true",
+        help="Actually send emails (default is to save as Drafts).",
+    )
+    parser.add_argument(
+        "--date",
+        default=datetime.date.today().isoformat(),
+        metavar="YYYY-MM-DD",
+        help="Process staging files for this date (default: today).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would happen without touching Outlook.",
+    )
+    args = parser.parse_args()
+
+    draft_only = not args.send
+    mode_label = "DRY-RUN" if args.dry_run else ("DRAFT" if draft_only else "LIVE SEND")
+    logger.info("=== Vendor Email Dispatch — %s — Mode: %s ===", args.date, mode_label)
+
+    contacts = load_contacts(CONTACTS_XLSX)
+    if not contacts and not args.dry_run:
+        logger.error("No contacts loaded. Create %s first.", CONTACTS_XLSX)
+        sys.exit(1)
+
+    staged = scan_staging(args.date)
+    if not staged:
+        logger.info("Nothing to send for %s.", args.date)
+        return
+
+    sent_ok:    list[str] = []
+    sent_fail:  list[str] = []
+    skipped:    list[str] = []
+
+    for folder_name, pdfs in staged.items():
+        vendor = _folder_name_to_vendor(folder_name, contacts)
+        if vendor is None:
+            logger.warning(
+                "No contact found for vendor folder '%s' — skipping.", folder_name
+            )
+            skipped.append(folder_name)
+            continue
+
+        contact = contacts[vendor]
+        ok = create_outlook_email(
+            vendor=vendor,
+            contact=contact,
+            pdfs=pdfs,
+            date_str=args.date,
+            draft_only=draft_only,
+            dry_run=args.dry_run,
+        )
+        (sent_ok if ok else sent_fail).append(vendor)
+
+    # Summary
+    logger.info("")
+    logger.info("─── Summary ───")
+    logger.info("  Succeeded : %d — %s", len(sent_ok),   ", ".join(sent_ok)   or "none")
+    logger.info("  Failed    : %d — %s", len(sent_fail), ", ".join(sent_fail) or "none")
+    logger.info("  Skipped   : %d — %s", len(skipped),   ", ".join(skipped)   or "none")
+
+    if skipped:
+        logger.info("")
+        logger.info(
+            "Add the following names (or their sanitised equivalents) to %s:",
+            CONTACTS_XLSX,
+        )
+        for s in skipped:
+            logger.info("  %s", s)
+
+    if sent_fail:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
