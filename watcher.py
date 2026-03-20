@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import zipfile as zf
 from collections import defaultdict
@@ -614,6 +615,10 @@ def write_and_route_vendor_pdfs(
     base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or "Orders"
     unmapped_dir = output_dir / "Unmapped Vendor Routes"
 
+    # If this same source file name is re-run, remove previous routed outputs first
+    # so stale vendor files are not left behind.
+    _remove_existing_routed_files_for_base(base, retailer, routes, unmapped_dir, logger)
+
     for vendor, data in vendor_pdfs.items():
         safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
         filename = f"{base} - {safe_vendor}.pdf"
@@ -626,6 +631,42 @@ def write_and_route_vendor_pdfs(
         route_dir.mkdir(parents=True, exist_ok=True)
         routed_file = route_dir / filename
         routed_file.write_bytes(data)
+
+
+def _remove_existing_routed_files_for_base(
+    base: str,
+    retailer: str,
+    routes: dict[tuple[str, str], Path],
+    unmapped_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    pattern = f"{base} - *.pdf"
+    candidate_dirs: set[Path] = {p for (r, _v), p in routes.items() if r == retailer}
+    candidate_dirs.add(unmapped_dir)
+
+    for d in candidate_dirs:
+        if not d.exists():
+            continue
+        for fp in d.glob(pattern):
+            try:
+                fp.unlink()
+            except OSError as e:
+                logger.warning("[%s] Could not remove old routed file %s: %s", retailer, fp, e)
+
+
+def _clear_directory_contents(dir_path: Path, logger: logging.Logger, label: str) -> None:
+    if not dir_path.exists():
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return
+
+    for child in dir_path.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError as e:
+            logger.warning("[%s] Could not clear %s item %s: %s", label, dir_path, child, e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,6 +706,9 @@ def process_pdf(
     logger: logging.Logger,
 ) -> None:
     logger.info("[%s] Processing: %s", retailer, pdf_path.name)
+
+    # Keep output folder limited to the current run only.
+    _clear_directory_contents(output_dir, logger, retailer)
 
     try:
         pdf_bytes = pdf_path.read_bytes()
