@@ -164,7 +164,8 @@ def _region_to_rect(page: fitz.Page, region: dict) -> fitz.Rect:
     right = region["x1"] * w
     top = (1 - region["y1"]) * h
     bottom = (1 - region["y0"]) * h
-    return fitz.Rect(left, top, right, bottom)
+    rect_rot = fitz.Rect(left, top, right, bottom)
+    return rect_rot * page.derotation_matrix
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core processing helpers  (exact copies of the logic in app.py)
@@ -402,7 +403,7 @@ def build_vendor_pdfs(pdf_bytes: bytes, page_vendor_rows: list[dict], retailer: 
 
             if redact_regions:
                 for reg in redact_regions:
-                    page.add_redact_annot(_region_to_rect(page, reg), fill=(0, 0, 0))
+                    page.add_redact_annot(_region_to_rect(page, reg), fill=(1, 1, 1))
                 page.apply_redactions()
 
         buf = BytesIO()
