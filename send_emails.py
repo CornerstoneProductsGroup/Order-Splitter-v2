@@ -57,6 +57,8 @@ EMAIL_STAGING_ROOT = Path("email_staging")
 SENT_ARCHIVE_ROOT  = EMAIL_STAGING_ROOT / "sent"
 SKIPPED_ARCHIVE_ROOT = EMAIL_STAGING_ROOT / "skipped"
 DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
+ROUTES_XLSX_PATH = Path("Vendor Output Routes.xlsx")
+ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
 DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
@@ -115,6 +117,33 @@ def load_contacts(xlsx_path: Path) -> dict[str, dict]:
         }
     logger.info("Loaded %d vendor contacts from %s", len(contacts), xlsx_path)
     return contacts
+
+
+def load_vendor_route_dirs(xlsx_path: Path) -> dict[str, set[Path]]:
+    """Return {vendor_name: {route_dir, ...}} from Vendor Output Routes.xlsx."""
+    if not xlsx_path.exists():
+        logger.warning("Route workbook not found: %s", xlsx_path)
+        return {}
+    try:
+        df = pd.read_excel(xlsx_path, dtype=str).fillna("")
+    except Exception as e:
+        logger.warning("Could not read route workbook %s: %s", xlsx_path, e)
+        return {}
+
+    df.columns = [c.strip() for c in df.columns]
+    path_col = next((c for c in ROUTES_PATH_COL_CANDIDATES if c in df.columns), None)
+    if path_col is None or "Vendor" not in df.columns:
+        logger.warning("Route workbook missing required columns: Vendor and Path/DestinationPath")
+        return {}
+
+    result: dict[str, set[Path]] = {}
+    for _, row in df.iterrows():
+        vendor = str(row.get("Vendor", "")).strip()
+        raw_path = str(row.get(path_col, "")).strip()
+        if not vendor or not raw_path:
+            continue
+        result.setdefault(vendor, set()).add(Path(raw_path))
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,41 +215,64 @@ def _build_retailer_list(pdfs: list[Path]) -> str:
     return "\n".join(f"  • {r}" for r in retailers) if retailers else "  • See attached"
 
 
-def collect_vendor_attachments(contact: dict, staged_order_pdfs: list[Path]) -> tuple[list[Path], int]:
-    """Return (attachments, extra_count) using only explicit LabelsFolder.
+def collect_vendor_attachments(
+    vendor: str,
+    contact: dict,
+    staged_order_pdfs: list[Path],
+    route_dirs_by_vendor: dict[str, set[Path]],
+) -> tuple[list[Path], int]:
+    """Return (attachments, extra_count) for staged orders plus label PDFs.
 
-    This keeps dry-run fast and predictable. If a vendor needs labels attached,
-    set LabelsFolder in vendor_email_contacts.xlsx.
+    Label source order:
+    1. LabelsFolder from the contacts sheet, if set
+    2. Otherwise, the vendor's normal output folder(s) from Vendor Output Routes.xlsx
+
+    In same-folder mode, only PDFs with a 7- or 8-digit filename stem are
+    treated as labels, matching the PO-number naming convention.
     """
     attachments: list[Path] = list(staged_order_pdfs)
     labels_folder_raw = (contact.get("labels_folder") or "").strip()
-    if not labels_folder_raw:
-        return attachments, 0
+    candidate_dirs: list[Path] = []
+    same_folder_mode = False
+    if labels_folder_raw:
+        candidate_dirs.append(Path(labels_folder_raw))
+    else:
+        candidate_dirs.extend(sorted(route_dirs_by_vendor.get(vendor, set()), key=lambda p: str(p).lower()))
+        same_folder_mode = True
 
-    labels_dir = Path(labels_folder_raw)
-    if not labels_dir.exists() or not labels_dir.is_dir():
-        logger.warning("LabelsFolder does not exist or is not a directory: %s", labels_dir)
+    if not candidate_dirs:
         return attachments, 0
 
     staged_set = {p.resolve() for p in staged_order_pdfs if p.exists()}
     staged_names = {p.name.lower() for p in staged_order_pdfs}
+    order_start = min((p.stat().st_mtime for p in staged_order_pdfs if p.exists()), default=0.0) - 10 * 60
     extra: list[Path] = []
-    for p in sorted(labels_dir.glob("*.pdf")):
-        try:
-            rp = p.resolve()
-            if rp in staged_set:
-                continue
-            if p.name.lower() in staged_names:
-                continue
-            extra.append(p)
-        except OSError:
+    for labels_dir in candidate_dirs:
+        if not labels_dir.exists() or not labels_dir.is_dir():
+            logger.warning("Labels folder does not exist or is not a directory: %s", labels_dir)
             continue
+
+        for p in sorted(labels_dir.glob("*.pdf")):
+            try:
+                rp = p.resolve()
+                if rp in staged_set:
+                    continue
+                if p.name.lower() in staged_names:
+                    continue
+                if same_folder_mode and not re.fullmatch(r"\d{7,8}", p.stem):
+                    continue
+                if same_folder_mode and p.stat().st_mtime < order_start:
+                    continue
+                extra.append(p)
+            except OSError:
+                continue
 
     # Keep deterministic order for labels (oldest -> newest).
     extra = sorted({p.resolve(): p for p in extra}.values(), key=lambda x: (x.stat().st_mtime, x.name.lower()))
     attachments.extend(extra)
     if extra:
-        logger.info("Including %d extra label PDF(s) from %s", len(extra), labels_dir)
+        source_desc = "vendor output folder" if same_folder_mode else "LabelsFolder"
+        logger.info("Including %d extra label PDF(s) for %s from %s", len(extra), vendor, source_desc)
     return attachments, len(extra)
 
 
@@ -419,6 +471,7 @@ def main() -> None:
     if not contacts and not args.dry_run:
         logger.error("No contacts loaded. Create/fix %s first.", contacts_path)
         sys.exit(1)
+    route_dirs_by_vendor = load_vendor_route_dirs(ROUTES_XLSX_PATH)
 
     staged = scan_staging(args.date)
     if not staged:
@@ -458,7 +511,7 @@ def main() -> None:
             continue
 
         contact = contacts[vendor]
-        attachments, extra_count = collect_vendor_attachments(contact, staged_order_pdfs)
+        attachments, extra_count = collect_vendor_attachments(vendor, contact, staged_order_pdfs, route_dirs_by_vendor)
         detail_lines.append(
             f"READY    | {vendor} | {len(staged_order_pdfs)} order PDF(s), {extra_count} label PDF(s) | {len(attachments)} total attachment(s)"
         )
