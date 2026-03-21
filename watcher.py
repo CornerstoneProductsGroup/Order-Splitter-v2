@@ -30,9 +30,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
-import sys
-import threading
 import time
 import datetime
 import zipfile as zf
@@ -70,12 +67,6 @@ ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
 # Vendor PDFs accumulate here across all retailer runs so one combined
 # email per vendor can be sent at end of day via send_emails.py.
 EMAIL_STAGING_ROOT = Path("email_staging")
-
-# Auto-email settings: when enabled, the watcher starts a single timer when the
-# first file in a batch is processed. After the delay, it sends one combined
-# email wave using send_emails.py (which already prevents resends by archiving).
-AUTO_EMAIL_ENABLED = True
-AUTO_EMAIL_DELAY_SECONDS = 2 * 60   # 2 minutes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (mirrors app.py)
@@ -880,73 +871,6 @@ def process_pdf(
             "[%s] %d page(s) flagged for review — included in ZIP under Needs Review/",
             retailer, review_count,
         )
-
-
-class AutoEmailScheduler:
-    """Debounce email dispatch so separate retailer downloads send as one wave.
-
-    Behavior:
-    - First processed file starts a timer (default 10 minutes)
-    - Additional files during that window do not start another timer
-    - When timer fires, run: send_emails.py --send --date YYYY-MM-DD
-    """
-
-    def __init__(self, logger: logging.Logger, enabled: bool, delay_seconds: int) -> None:
-        self.logger = logger
-        self.enabled = enabled
-        self.delay_seconds = max(1, int(delay_seconds))
-        self._lock = threading.Lock()
-        self._timer: threading.Timer | None = None
-
-    def note_file_processed(self) -> None:
-        if not self.enabled:
-            return
-        with self._lock:
-            if self._timer is not None and self._timer.is_alive():
-                return
-
-            target_date = datetime.date.today().isoformat()
-            self._timer = threading.Timer(self.delay_seconds, self._dispatch_emails, args=(target_date,))
-            self._timer.daemon = True
-            self._timer.start()
-            self.logger.info(
-                "[Auto Email] Timer started for %s. Sending in %d seconds.",
-                target_date,
-                self.delay_seconds,
-            )
-
-    def _dispatch_emails(self, target_date: str) -> None:
-        cmd = [
-            sys.executable,
-            str(Path(__file__).with_name("send_emails.py")),
-            "--send",
-            "--date",
-            target_date,
-        ]
-        try:
-            self.logger.info("[Auto Email] Dispatching: %s", " ".join(cmd))
-            proc = subprocess.run(
-                cmd,
-                cwd=str(Path(__file__).resolve().parent),
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            if proc.returncode == 0:
-                self.logger.info("[Auto Email] Email dispatch completed for %s.", target_date)
-            else:
-                self.logger.error("[Auto Email] Dispatch failed for %s (exit %s).", target_date, proc.returncode)
-                if proc.stdout:
-                    self.logger.error("[Auto Email] stdout:\n%s", proc.stdout.strip())
-                if proc.stderr:
-                    self.logger.error("[Auto Email] stderr:\n%s", proc.stderr.strip())
-        except Exception as e:
-            self.logger.error("[Auto Email] Unexpected dispatch error for %s: %s", target_date, e)
-        finally:
-            with self._lock:
-                self._timer = None
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Watchdog event handler
 # ─────────────────────────────────────────────────────────────────────────────
@@ -958,7 +882,6 @@ class PDFHandler(FileSystemEventHandler):
         crop_cfg: dict,
         output_dir: Path,
         routes: dict[tuple[str, str], Path],
-        email_scheduler: AutoEmailScheduler,
         logger: logging.Logger,
     ) -> None:
         super().__init__()
@@ -966,7 +889,6 @@ class PDFHandler(FileSystemEventHandler):
         self.crop_cfg  = crop_cfg
         self.output_dir = output_dir
         self.routes = routes
-        self.email_scheduler = email_scheduler
         self.logger    = logger
         self._last_seen: dict[str, float] = {}
 
@@ -991,7 +913,6 @@ class PDFHandler(FileSystemEventHandler):
 
         try:
             process_pdf(path, self.retailer, self.crop_cfg, self.output_dir, self.routes, self.logger)
-            self.email_scheduler.note_file_processed()
         except Exception as e:
             self.logger.exception(
                 "[%s] Unhandled error processing %s: %s", self.retailer, path.name, e
@@ -1038,23 +959,10 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
     crop_cfg = load_crop_config()
-    email_scheduler = AutoEmailScheduler(
-        logger=logger,
-        enabled=AUTO_EMAIL_ENABLED,
-        delay_seconds=AUTO_EMAIL_DELAY_SECONDS,
-    )
-
-    if AUTO_EMAIL_ENABLED:
-        logger.info(
-            "Auto email dispatch is ENABLED (delay: %d seconds from first processed file).",
-            AUTO_EMAIL_DELAY_SECONDS,
-        )
-    else:
-        logger.info("Auto email dispatch is DISABLED.")
 
     observer = Observer()
     for retailer, watch_dir in WATCH_DIRS.items():
-        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], routes, email_scheduler, logger)
+        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], routes, logger)
         observer.schedule(handler, str(watch_dir), recursive=False)
         logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
         logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
