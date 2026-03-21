@@ -57,6 +57,8 @@ EMAIL_STAGING_ROOT = Path("email_staging")
 SENT_ARCHIVE_ROOT  = EMAIL_STAGING_ROOT / "sent"
 SKIPPED_ARCHIVE_ROOT = EMAIL_STAGING_ROOT / "skipped"
 DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
+LABEL_LOOKBACK_SECONDS = 10 * 60       # allow slight clock/save skew before order write
+LABEL_LOOKAHEAD_SECONDS = 2 * 60 * 60  # include labels created up to 2 hours after orders
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
 DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
@@ -196,7 +198,8 @@ def collect_vendor_attachments(
     This avoids slow or hanging scans across vendor route shares.
 
     To support a mixed folder (orders + labels in the same folder), only PDFs
-    whose filename stem is all digits with length 7-11 are treated as labels.
+    whose filename stem is all digits with length 7-11 are treated as labels,
+    and only when their modified time is near the current staged order files.
     """
     attachments: list[Path] = list(staged_order_pdfs)
     labels_folder_raw = (contact.get("labels_folder") or "").strip()
@@ -210,6 +213,14 @@ def collect_vendor_attachments(
 
     staged_set = {p.resolve() for p in staged_order_pdfs if p.exists()}
     staged_names = {p.name.lower() for p in staged_order_pdfs}
+    staged_mtimes = [p.stat().st_mtime for p in staged_order_pdfs if p.exists()]
+    if staged_mtimes:
+        window_start = min(staged_mtimes) - LABEL_LOOKBACK_SECONDS
+        window_end = max(staged_mtimes) + LABEL_LOOKAHEAD_SECONDS
+    else:
+        window_start = 0.0
+        window_end = float("inf")
+
     extra: list[Path] = []
     for p in sorted(labels_dir.glob("*.pdf")):
         try:
@@ -219,6 +230,9 @@ def collect_vendor_attachments(
             if p.name.lower() in staged_names:
                 continue
             if not re.fullmatch(r"\d{7,11}", p.stem):
+                continue
+            mtime = p.stat().st_mtime
+            if not (window_start <= mtime <= window_end):
                 continue
             extra.append(p)
         except OSError:
