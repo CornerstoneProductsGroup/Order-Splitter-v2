@@ -31,6 +31,7 @@ Optional columns:
   BCC      – BCC address(es), semicolon-separated
   Subject  – custom subject line (leave blank to use the default)
   Body     – custom plain-text body (leave blank to use the default)
+    LabelsFolder – optional folder path containing extra label PDFs to attach
 
 Any vendor in the staging folder that has NO row in this file will be skipped
 and listed in the summary at the end.
@@ -75,7 +76,7 @@ logger = logging.getLogger("send_emails")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_contacts(xlsx_path: Path) -> dict[str, dict]:
-    """Return {vendor_name: {email, cc, bcc, subject, body}} from the xlsx."""
+    """Return {vendor_name: {email, cc, bcc, subject, body, labels_folder}} from the xlsx."""
     if not xlsx_path.exists():
         logger.error("Contact file not found: %s", xlsx_path)
         return {}
@@ -106,6 +107,7 @@ def load_contacts(xlsx_path: Path) -> dict[str, dict]:
             "bcc":     str(row.get("BCC",     "")).strip(),
             "subject": str(row.get("Subject", "")).strip(),
             "body":    str(row.get("Body",    "")).strip(),
+            "labels_folder": str(row.get("LabelsFolder", "")).strip(),
         }
     logger.info("Loaded %d vendor contacts from %s", len(contacts), xlsx_path)
     return contacts
@@ -178,6 +180,49 @@ def _build_retailer_list(pdfs: list[Path]) -> str:
         if "tractor supply" in stem_lower and "Tractor Supply" not in retailers:
             retailers.append("Tractor Supply")
     return "\n".join(f"  • {r}" for r in retailers) if retailers else "  • See attached"
+
+
+def collect_vendor_attachments(contact: dict, staged_order_pdfs: list[Path]) -> list[Path]:
+    """Return final attachment list: staged order PDFs + optional label PDFs.
+
+    If LabelsFolder is configured for a vendor, include PDFs from that folder
+    that were modified after the first staged order PDF for the current send.
+    """
+    attachments: list[Path] = list(staged_order_pdfs)
+    labels_folder_raw = (contact.get("labels_folder") or "").strip()
+    if not labels_folder_raw:
+        return attachments
+
+    labels_dir = Path(labels_folder_raw)
+    if not labels_dir.exists() or not labels_dir.is_dir():
+        logger.warning("LabelsFolder does not exist or is not a directory: %s", labels_dir)
+        return attachments
+
+    if staged_order_pdfs:
+        order_cutoff = min(p.stat().st_mtime for p in staged_order_pdfs if p.exists())
+    else:
+        order_cutoff = 0.0
+
+    staged_set = {p.resolve() for p in staged_order_pdfs if p.exists()}
+    extra: list[Path] = []
+    for p in sorted(labels_dir.glob("*.pdf")):
+        try:
+            rp = p.resolve()
+            if rp in staged_set:
+                continue
+            if p.stat().st_mtime + 1.0 < order_cutoff:
+                # Skip clearly older files to reduce accidental old-label attachments.
+                continue
+            extra.append(p)
+        except OSError:
+            continue
+
+    # Keep deterministic order for labels (oldest -> newest).
+    extra.sort(key=lambda x: (x.stat().st_mtime, x.name.lower()))
+    attachments.extend(extra)
+    if extra:
+        logger.info("Including %d extra label PDF(s) from %s", len(extra), labels_dir)
+    return attachments
 
 
 def archive_sent_attachments(date_str: str, vendor_folder: str, pdfs: list[Path]) -> None:
@@ -346,7 +391,7 @@ def main() -> None:
     sent_fail:  list[str] = []
     skipped:    list[str] = []
 
-    for folder_name, pdfs in staged.items():
+    for folder_name, staged_order_pdfs in staged.items():
         vendor = _folder_name_to_vendor(folder_name, contacts)
         if vendor is None:
             logger.warning(
@@ -356,16 +401,18 @@ def main() -> None:
             continue
 
         contact = contacts[vendor]
+        attachments = collect_vendor_attachments(contact, staged_order_pdfs)
         ok = create_outlook_email(
             vendor=vendor,
             contact=contact,
-            pdfs=pdfs,
+            pdfs=attachments,
             date_str=args.date,
             draft_only=draft_only,
             dry_run=args.dry_run,
         )
         if ok and args.send and not args.dry_run:
-            archive_sent_attachments(args.date, folder_name, pdfs)
+            # Archive only staged order PDFs; label files stay in their own folder.
+            archive_sent_attachments(args.date, folder_name, staged_order_pdfs)
             logger.info("Archived sent attachments for %s so they cannot resend.", vendor)
         (sent_ok if ok else sent_fail).append(vendor)
 
