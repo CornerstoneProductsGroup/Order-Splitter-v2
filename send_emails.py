@@ -113,7 +113,11 @@ def load_contacts(xlsx_path: Path) -> dict[str, dict]:
             "bcc":     str(row.get("BCC",     "")).strip(),
             "subject": str(row.get("Subject", "")).strip(),
             "body":    str(row.get("Body",    "")).strip(),
-            "labels_folder": str(row.get("LabelsFolder", "")).strip(),
+            "labels_folder": str(
+                row.get("LabelsFolder", "")
+                or row.get("Label File Path", "")
+                or row.get("LabelFilePath", "")
+            ).strip(),
         }
     logger.info("Loaded %d vendor contacts from %s", len(contacts), xlsx_path)
     return contacts
