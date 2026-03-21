@@ -33,7 +33,7 @@ Optional columns:
   CC       – CC address(es), semicolon-separated
   BCC      – BCC address(es), semicolon-separated
   Subject  – custom subject line (leave blank to use the default)
-  Body     – custom plain-text body (leave blank to use the default)
+    Body     – custom plain-text body (leave blank to use the default)
     LabelsFolder – optional folder path containing extra label PDFs to attach
 
 Any vendor in the staging folder that has NO row in this file will be skipped
@@ -57,8 +57,6 @@ EMAIL_STAGING_ROOT = Path("email_staging")
 SENT_ARCHIVE_ROOT  = EMAIL_STAGING_ROOT / "sent"
 SKIPPED_ARCHIVE_ROOT = EMAIL_STAGING_ROOT / "skipped"
 DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
-ROUTES_XLSX_PATH = Path("Vendor Output Routes.xlsx")
-ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
 DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
@@ -117,34 +115,6 @@ def load_contacts(xlsx_path: Path) -> dict[str, dict]:
         }
     logger.info("Loaded %d vendor contacts from %s", len(contacts), xlsx_path)
     return contacts
-
-
-def load_vendor_route_dirs(xlsx_path: Path) -> dict[str, set[Path]]:
-    """Return {vendor_name: {route_dir, ...}} from Vendor Output Routes.xlsx."""
-    if not xlsx_path.exists():
-        logger.warning("Route workbook not found: %s", xlsx_path)
-        return {}
-    try:
-        df = pd.read_excel(xlsx_path, dtype=str).fillna("")
-    except Exception as e:
-        logger.warning("Could not read route workbook %s: %s", xlsx_path, e)
-        return {}
-
-    df.columns = [c.strip() for c in df.columns]
-    path_col = next((c for c in ROUTES_PATH_COL_CANDIDATES if c in df.columns), None)
-    if path_col is None or "Vendor" not in df.columns:
-        logger.warning("Route workbook missing required columns: Vendor and Path/DestinationPath")
-        return {}
-
-    result: dict[str, set[Path]] = {}
-    for _, row in df.iterrows():
-        vendor = str(row.get("Vendor", "")).strip()
-        raw_path = str(row.get(path_col, "")).strip()
-        if not vendor or not raw_path:
-            continue
-        result.setdefault(vendor, set()).add(Path(raw_path))
-    logger.info("Loaded route directories for %d vendor(s) from %s", len(result), xlsx_path)
-    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,65 +186,42 @@ def _build_retailer_list(pdfs: list[Path]) -> str:
     return "\n".join(f"  • {r}" for r in retailers) if retailers else "  • See attached"
 
 
-def collect_vendor_attachments(vendor: str, contact: dict, staged_order_pdfs: list[Path], route_dirs_by_vendor: dict[str, set[Path]]) -> list[Path]:
-    """Return final attachment list: staged order PDFs + optional label PDFs.
+def collect_vendor_attachments(contact: dict, staged_order_pdfs: list[Path]) -> tuple[list[Path], int]:
+    """Return (attachments, extra_count) using only explicit LabelsFolder.
 
-    Source order:
-    1. staged order PDFs
-    2. optional LabelsFolder from contacts sheet
-    3. if LabelsFolder is blank, infer vendor folder(s) from Vendor Output Routes.xlsx
-
-    For inferred vendor folders, include only recent extra PDFs around the order
-    creation time so old folder contents are not swept into the email.
+    This keeps dry-run fast and predictable. If a vendor needs labels attached,
+    set LabelsFolder in vendor_email_contacts.xlsx.
     """
     attachments: list[Path] = list(staged_order_pdfs)
     labels_folder_raw = (contact.get("labels_folder") or "").strip()
+    if not labels_folder_raw:
+        return attachments, 0
+
+    labels_dir = Path(labels_folder_raw)
+    if not labels_dir.exists() or not labels_dir.is_dir():
+        logger.warning("LabelsFolder does not exist or is not a directory: %s", labels_dir)
+        return attachments, 0
+
     staged_set = {p.resolve() for p in staged_order_pdfs if p.exists()}
     staged_names = {p.name.lower() for p in staged_order_pdfs}
-
-    candidate_dirs: list[Path] = []
-    if labels_folder_raw:
-        candidate_dirs.append(Path(labels_folder_raw))
-    else:
-        candidate_dirs.extend(sorted(route_dirs_by_vendor.get(vendor, set()), key=lambda p: str(p).lower()))
-
-    if not candidate_dirs:
-        return attachments
-
-    if staged_order_pdfs:
-        mtimes = [p.stat().st_mtime for p in staged_order_pdfs if p.exists()]
-        order_start = min(mtimes) - 10 * 60 if mtimes else 0.0
-        order_end = max(mtimes) + 2 * 60 * 60 if mtimes else float("inf")
-    else:
-        order_start = 0.0
-        order_end = float("inf")
-
     extra: list[Path] = []
-    for labels_dir in candidate_dirs:
-        if not labels_dir.exists() or not labels_dir.is_dir():
-            logger.warning("Labels/vendor folder does not exist or is not a directory: %s", labels_dir)
-            continue
-
-        for p in sorted(labels_dir.glob("*.pdf")):
-            try:
-                rp = p.resolve()
-                if rp in staged_set:
-                    continue
-                if p.name.lower() in staged_names:
-                    continue
-                mtime = p.stat().st_mtime
-                if not (order_start <= mtime <= order_end):
-                    continue
-                extra.append(p)
-            except OSError:
+    for p in sorted(labels_dir.glob("*.pdf")):
+        try:
+            rp = p.resolve()
+            if rp in staged_set:
                 continue
+            if p.name.lower() in staged_names:
+                continue
+            extra.append(p)
+        except OSError:
+            continue
 
     # Keep deterministic order for labels (oldest -> newest).
     extra = sorted({p.resolve(): p for p in extra}.values(), key=lambda x: (x.stat().st_mtime, x.name.lower()))
     attachments.extend(extra)
     if extra:
-        logger.info("Including %d extra PDF(s) for %s from vendor/label folder lookup", len(extra), vendor)
-    return attachments
+        logger.info("Including %d extra label PDF(s) from %s", len(extra), labels_dir)
+    return attachments, len(extra)
 
 
 def archive_sent_attachments(date_str: str, vendor_folder: str, pdfs: list[Path]) -> None:
@@ -473,8 +420,6 @@ def main() -> None:
         logger.error("No contacts loaded. Create/fix %s first.", contacts_path)
         sys.exit(1)
 
-    route_dirs_by_vendor = load_vendor_route_dirs(ROUTES_XLSX_PATH)
-
     staged = scan_staging(args.date)
     if not staged:
         logger.info("Nothing to send for %s.", args.date)
@@ -494,6 +439,7 @@ def main() -> None:
     sent_ok:    list[str] = []
     sent_fail:  list[str] = []
     skipped:    list[str] = []
+    detail_lines: list[str] = []
 
     for folder_name, staged_order_pdfs in staged.items():
         vendor = _folder_name_to_vendor(folder_name, contacts)
@@ -507,11 +453,15 @@ def main() -> None:
                     "Archived skipped PDFs for vendor folder '%s' so they cannot send later.",
                     folder_name,
                 )
+            detail_lines.append(f"SKIPPED  | {folder_name} | {len(staged_order_pdfs)} staged PDF(s) | no contact row")
             skipped.append(folder_name)
             continue
 
         contact = contacts[vendor]
-        attachments = collect_vendor_attachments(vendor, contact, staged_order_pdfs, route_dirs_by_vendor)
+        attachments, extra_count = collect_vendor_attachments(contact, staged_order_pdfs)
+        detail_lines.append(
+            f"READY    | {vendor} | {len(staged_order_pdfs)} order PDF(s), {extra_count} label PDF(s) | {len(attachments)} total attachment(s)"
+        )
         ok = create_outlook_email(
             vendor=vendor,
             contact=contact,
@@ -529,6 +479,8 @@ def main() -> None:
     # Summary
     logger.info("")
     logger.info("─── Summary ───")
+    for line in detail_lines:
+        logger.info("  %s", line)
     logger.info("  Succeeded : %d — %s", len(sent_ok),   ", ".join(sent_ok)   or "none")
     logger.info("  Failed    : %d — %s", len(sent_fail), ", ".join(sent_fail) or "none")
     logger.info("  Skipped   : %d — %s", len(skipped),   ", ".join(skipped)   or "none")
