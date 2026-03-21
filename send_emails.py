@@ -5,7 +5,7 @@ For each vendor that has files in today's email staging folder, this script
 creates one Outlook email with ALL of that vendor's PDFs attached — regardless
 of which retailer (Depot, Lowe's, Tractor Supply) generated them.
 
-Vendor email addresses are read from Email Routing.xlsx.
+Vendor email addresses are read from vendor_email_contacts.xlsx.
 
 Usage
 -----
@@ -21,8 +21,8 @@ Usage
   # Preview what would be sent without touching Outlook:
   python send_emails.py --dry-run
 
-Contact spreadsheet (Email Routing.xlsx)
----------------------------------------
+Contact spreadsheet (vendor_email_contacts.xlsx)
+-------------------------------------------------
 Required columns:
   Vendor   – must match the vendor name exactly as it appears in the vendor maps
   Email    – primary To address (required; separate multiple with semicolons)
@@ -50,8 +50,7 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 
 EMAIL_STAGING_ROOT = Path("email_staging")
-DEFAULT_CONTACTS_XLSX = Path("Email Routing.xlsx")
-FALLBACK_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
+DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
 DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
@@ -299,7 +298,7 @@ def main() -> None:
     parser.add_argument(
         "--contacts",
         default="",
-        help="Optional path to the contacts workbook. Defaults to 'Email Routing.xlsx'.",
+        help="Optional path to the contacts workbook. Defaults to 'vendor_email_contacts.xlsx'.",
     )
     args = parser.parse_args()
 
@@ -308,9 +307,6 @@ def main() -> None:
     logger.info("=== Vendor Email Dispatch — %s — Mode: %s ===", args.date, mode_label)
 
     contacts_path = Path(args.contacts) if args.contacts else DEFAULT_CONTACTS_XLSX
-    if not contacts_path.exists() and not args.contacts and FALLBACK_CONTACTS_XLSX.exists():
-        contacts_path = FALLBACK_CONTACTS_XLSX
-        logger.info("Using fallback contacts workbook: %s", contacts_path)
 
     contacts = load_contacts(contacts_path)
     if not contacts and not args.dry_run:
