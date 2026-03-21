@@ -227,8 +227,8 @@ def collect_vendor_attachments(
     1. LabelsFolder from the contacts sheet, if set
     2. Otherwise, the vendor's normal output folder(s) from Vendor Output Routes.xlsx
 
-    In same-folder mode, only PDFs with a 7- or 8-digit filename stem are
-    treated as labels, matching the PO-number naming convention.
+    In same-folder mode, only PDFs with a 7- to 11-digit filename stem are
+    treated as labels, matching PO-number naming conventions across retailers.
     """
     attachments: list[Path] = list(staged_order_pdfs)
     labels_folder_raw = (contact.get("labels_folder") or "").strip()
@@ -259,7 +259,7 @@ def collect_vendor_attachments(
                     continue
                 if p.name.lower() in staged_names:
                     continue
-                if same_folder_mode and not re.fullmatch(r"\d{7,8}", p.stem):
+                if same_folder_mode and not re.fullmatch(r"\d{7,11}", p.stem):
                     continue
                 if same_folder_mode and p.stat().st_mtime < order_start:
                     continue
