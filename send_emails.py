@@ -52,6 +52,7 @@ import pandas as pd
 
 EMAIL_STAGING_ROOT = Path("email_staging")
 SENT_ARCHIVE_ROOT  = EMAIL_STAGING_ROOT / "sent"
+SKIPPED_ARCHIVE_ROOT = EMAIL_STAGING_ROOT / "skipped"
 DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
@@ -248,6 +249,27 @@ def archive_sent_attachments(date_str: str, vendor_folder: str, pdfs: list[Path]
         pass
 
 
+def archive_skipped_attachments(date_str: str, vendor_folder: str, pdfs: list[Path]) -> None:
+    """Move skipped vendor PDFs out of staging so they cannot be sent later."""
+    dest_dir = SKIPPED_ARCHIVE_ROOT / date_str / vendor_folder
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    for src in pdfs:
+        if not src.exists():
+            continue
+        dest = dest_dir / src.name
+        if dest.exists():
+            dest.unlink()
+        src.replace(dest)
+
+    src_vendor_dir = EMAIL_STAGING_ROOT / date_str / vendor_folder
+    try:
+        if src_vendor_dir.exists() and not any(src_vendor_dir.iterdir()):
+            src_vendor_dir.rmdir()
+    except OSError:
+        pass
+
+
 def create_outlook_email(
     vendor: str,
     contact: dict,
@@ -397,6 +419,12 @@ def main() -> None:
             logger.warning(
                 "No contact found for vendor folder '%s' — skipping.", folder_name
             )
+            if not args.dry_run:
+                archive_skipped_attachments(args.date, folder_name, staged_order_pdfs)
+                logger.info(
+                    "Archived skipped PDFs for vendor folder '%s' so they cannot send later.",
+                    folder_name,
+                )
             skipped.append(folder_name)
             continue
 
