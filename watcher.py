@@ -75,7 +75,7 @@ EMAIL_STAGING_ROOT = Path("email_staging")
 # first file in a batch is processed. After the delay, it sends one combined
 # email wave using send_emails.py (which already prevents resends by archiving).
 AUTO_EMAIL_ENABLED = True
-AUTO_EMAIL_DELAY_SECONDS = 5 * 60   # 5 minutes
+AUTO_EMAIL_DELAY_SECONDS = 2 * 60   # 2 minutes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (mirrors app.py)
