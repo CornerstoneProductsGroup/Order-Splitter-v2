@@ -21,6 +21,9 @@ Usage
   # Preview what would be sent without touching Outlook:
   python send_emails.py --dry-run
 
+    # Clear all pending staged PDFs for a date without sending:
+    python send_emails.py --clear-pending
+
 Contact spreadsheet (vendor_email_contacts.xlsx)
 -------------------------------------------------
 Required columns:
@@ -186,8 +189,9 @@ def _build_retailer_list(pdfs: list[Path]) -> str:
 def collect_vendor_attachments(contact: dict, staged_order_pdfs: list[Path]) -> list[Path]:
     """Return final attachment list: staged order PDFs + optional label PDFs.
 
-    If LabelsFolder is configured for a vendor, include PDFs from that folder
-    that were modified after the first staged order PDF for the current send.
+    If LabelsFolder is configured for a vendor, include all PDFs from that
+    folder. This matches the real workflow where labels may be created before
+    or after the order PDF lands in staging.
     """
     attachments: list[Path] = list(staged_order_pdfs)
     labels_folder_raw = (contact.get("labels_folder") or "").strip()
@@ -199,20 +203,12 @@ def collect_vendor_attachments(contact: dict, staged_order_pdfs: list[Path]) -> 
         logger.warning("LabelsFolder does not exist or is not a directory: %s", labels_dir)
         return attachments
 
-    if staged_order_pdfs:
-        order_cutoff = min(p.stat().st_mtime for p in staged_order_pdfs if p.exists())
-    else:
-        order_cutoff = 0.0
-
     staged_set = {p.resolve() for p in staged_order_pdfs if p.exists()}
     extra: list[Path] = []
     for p in sorted(labels_dir.glob("*.pdf")):
         try:
             rp = p.resolve()
             if rp in staged_set:
-                continue
-            if p.stat().st_mtime + 1.0 < order_cutoff:
-                # Skip clearly older files to reduce accidental old-label attachments.
                 continue
             extra.append(p)
         except OSError:
@@ -268,6 +264,19 @@ def archive_skipped_attachments(date_str: str, vendor_folder: str, pdfs: list[Pa
             src_vendor_dir.rmdir()
     except OSError:
         pass
+
+
+def archive_pending_attachments(date_str: str, staged: dict[str, list[Path]]) -> int:
+    """Move all active staged PDFs for the date into skipped archive.
+
+    This is a manual sanity-reset command so pending items cannot be sent later.
+    Returns the number of moved PDFs.
+    """
+    moved = 0
+    for vendor_folder, pdfs in staged.items():
+        archive_skipped_attachments(date_str, vendor_folder, pdfs)
+        moved += len([p for p in pdfs if p.exists()])
+    return moved
 
 
 def create_outlook_email(
@@ -391,6 +400,11 @@ def main() -> None:
         default="",
         help="Optional path to the contacts workbook. Defaults to 'vendor_email_contacts.xlsx'.",
     )
+    parser.add_argument(
+        "--clear-pending",
+        action="store_true",
+        help="Archive all active staged PDFs for the date without sending.",
+    )
     args = parser.parse_args()
 
     draft_only = not args.send
@@ -407,6 +421,17 @@ def main() -> None:
     staged = scan_staging(args.date)
     if not staged:
         logger.info("Nothing to send for %s.", args.date)
+        return
+
+    if args.clear_pending:
+        pending_count = sum(len(pdfs) for pdfs in staged.values())
+        for vendor_folder, pdfs in staged.items():
+            archive_skipped_attachments(args.date, vendor_folder, pdfs)
+        logger.info(
+            "Archived %d pending staged PDF(s) for %s. Nothing was sent.",
+            pending_count,
+            args.date,
+        )
         return
 
     sent_ok:    list[str] = []
