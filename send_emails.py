@@ -43,8 +43,10 @@ and listed in the summary at the end.
 import argparse
 import datetime
 import logging
+import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -59,6 +61,7 @@ SKIPPED_ARCHIVE_ROOT = EMAIL_STAGING_ROOT / "skipped"
 DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
 LABEL_LOOKBACK_SECONDS = 10 * 60       # allow slight clock/save skew before order write
 LABEL_LOOKAHEAD_SECONDS = 2 * 60 * 60  # include labels created up to 2 hours after orders
+LABEL_SCAN_TIMEOUT_SECONDS = 8          # prevent one network folder from hanging the run
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
 DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
@@ -207,6 +210,9 @@ def collect_vendor_attachments(
     """
     attachments: list[Path] = list(staged_order_pdfs)
     labels_folder_raw = (contact.get("labels_folder") or "").strip()
+    if labels_folder_raw.lower() in {"", "nan", "none", "null"}:
+        return attachments, 0
+
     if not labels_folder_raw:
         return attachments, 0
 
@@ -226,21 +232,45 @@ def collect_vendor_attachments(
         window_end = float("inf")
 
     extra: list[Path] = []
-    for p in sorted(labels_dir.glob("*.pdf")):
-        try:
-            rp = p.resolve()
-            if rp in staged_set:
-                continue
-            if p.name.lower() in staged_names:
-                continue
-            if not re.fullmatch(r"\d{7,11}", p.stem):
-                continue
-            mtime = p.stat().st_mtime
-            if not (window_start <= mtime <= window_end):
-                continue
-            extra.append(p)
-        except OSError:
-            continue
+    deadline = time.monotonic() + LABEL_SCAN_TIMEOUT_SECONDS
+    try:
+        with os.scandir(labels_dir) as it:
+            for entry in it:
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "Labels scan timed out after %ss for %s; continuing with files found so far.",
+                        LABEL_SCAN_TIMEOUT_SECONDS,
+                        labels_dir,
+                    )
+                    break
+
+                if not entry.is_file():
+                    continue
+
+                name = entry.name
+                if not name.lower().endswith(".pdf"):
+                    continue
+
+                stem = Path(name).stem
+                if not re.fullmatch(r"\d{7,11}", stem):
+                    continue
+
+                p = Path(entry.path)
+                try:
+                    rp = p.resolve()
+                    if rp in staged_set:
+                        continue
+                    if name.lower() in staged_names:
+                        continue
+                    mtime = entry.stat().st_mtime
+                    if not (window_start <= mtime <= window_end):
+                        continue
+                    extra.append(p)
+                except OSError:
+                    continue
+    except OSError as e:
+        logger.warning("Could not scan LabelsFolder %s: %s", labels_dir, e)
+        return attachments, 0
 
     # Keep deterministic order for labels (oldest -> newest).
     extra = sorted({p.resolve(): p for p in extra}.values(), key=lambda x: (x.stat().st_mtime, x.name.lower()))
