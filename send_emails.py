@@ -50,6 +50,7 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 
 EMAIL_STAGING_ROOT = Path("email_staging")
+SENT_ARCHIVE_ROOT  = EMAIL_STAGING_ROOT / "sent"
 DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
@@ -166,17 +167,40 @@ def _folder_name_to_vendor(folder_name: str, contacts: dict[str, dict]) -> str |
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_retailer_list(pdfs: list[Path]) -> str:
-    """Extract retailer names from PDF file names like 'Base - Home_Depot.pdf'."""
+    """Best-effort retailer extraction from attachment file names."""
     retailers: list[str] = []
     for p in pdfs:
-        # Filename pattern written by watcher: "{base} - {retailer_slug}.pdf"
-        stem = p.stem
-        parts = stem.rsplit(" - ", 1)
-        if len(parts) == 2:
-            retailer = parts[1].replace("_", " ").title()
-            if retailer not in retailers:
-                retailers.append(retailer)
+        stem_lower = p.stem.lower()
+        if "home depot" in stem_lower and "Home Depot" not in retailers:
+            retailers.append("Home Depot")
+        if "lowe" in stem_lower and "Lowe's" not in retailers:
+            retailers.append("Lowe's")
+        if "tractor supply" in stem_lower and "Tractor Supply" not in retailers:
+            retailers.append("Tractor Supply")
     return "\n".join(f"  • {r}" for r in retailers) if retailers else "  • See attached"
+
+
+def archive_sent_attachments(date_str: str, vendor_folder: str, pdfs: list[Path]) -> None:
+    """Move successfully sent attachments out of staging so they cannot resend."""
+    dest_dir = SENT_ARCHIVE_ROOT / date_str / vendor_folder
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    for src in pdfs:
+        if not src.exists():
+            continue
+        dest = dest_dir / src.name
+        # Overwrite existing archive copy if present.
+        if dest.exists():
+            dest.unlink()
+        src.replace(dest)
+
+    # Remove now-empty vendor folder from staging.
+    src_vendor_dir = EMAIL_STAGING_ROOT / date_str / vendor_folder
+    try:
+        if src_vendor_dir.exists() and not any(src_vendor_dir.iterdir()):
+            src_vendor_dir.rmdir()
+    except OSError:
+        pass
 
 
 def create_outlook_email(
@@ -340,6 +364,9 @@ def main() -> None:
             draft_only=draft_only,
             dry_run=args.dry_run,
         )
+        if ok and args.send and not args.dry_run:
+            archive_sent_attachments(args.date, folder_name, pdfs)
+            logger.info("Archived sent attachments for %s so they cannot resend.", vendor)
         (sent_ok if ok else sent_fail).append(vendor)
 
     # Summary

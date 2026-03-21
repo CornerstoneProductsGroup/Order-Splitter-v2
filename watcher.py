@@ -695,19 +695,18 @@ def _stage_vendor_pdfs_for_email(
 ) -> None:
     """Write vendor PDFs to the daily email staging folder.
 
-    Layout:  email_staging/{YYYY-MM-DD}/{VendorName}/{base} - {vendor} - {retailer}.pdf
+    Layout:  email_staging/{YYYY-MM-DD}/{VendorName}/{base} - {vendor}.pdf
     The send_emails.py script reads this folder to build one email per vendor
     with all retailers' attachments combined.
     """
     today = datetime.date.today().isoformat()   # e.g. "2026-03-20"
-    retailer_slug = re.sub(r"[^\w]", "_", retailer)
 
     for vendor, data in vendor_pdfs.items():
         safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
         vendor_dir = EMAIL_STAGING_ROOT / today / safe_vendor
         try:
             vendor_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{base} - {safe_vendor} - {retailer_slug}.pdf"
+            filename = f"{base} - {safe_vendor}.pdf"
             (vendor_dir / filename).write_bytes(data)
         except OSError as e:
             logger.warning("[%s] Could not stage email PDF for vendor '%s': %s", retailer, vendor, e)
