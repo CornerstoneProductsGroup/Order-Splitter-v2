@@ -5,7 +5,7 @@ For each vendor that has files in today's email staging folder, this script
 creates one Outlook email with ALL of that vendor's PDFs attached — regardless
 of which retailer (Depot, Lowe's, Tractor Supply) generated them.
 
-Vendor email addresses are read from vendor_email_contacts.xlsx.
+Vendor email addresses are read from Email Routing.xlsx.
 
 Usage
 -----
@@ -21,8 +21,8 @@ Usage
   # Preview what would be sent without touching Outlook:
   python send_emails.py --dry-run
 
-Contact spreadsheet (vendor_email_contacts.xlsx)
--------------------------------------------------
+Contact spreadsheet (Email Routing.xlsx)
+---------------------------------------
 Required columns:
   Vendor   – must match the vendor name exactly as it appears in the vendor maps
   Email    – primary To address (required; separate multiple with semicolons)
@@ -50,7 +50,8 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 
 EMAIL_STAGING_ROOT = Path("email_staging")
-CONTACTS_XLSX      = Path("vendor_email_contacts.xlsx")
+DEFAULT_CONTACTS_XLSX = Path("Email Routing.xlsx")
+FALLBACK_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
 DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
@@ -149,6 +150,15 @@ def _folder_name_to_vendor(folder_name: str, contacts: dict[str, dict]) -> str |
     for vendor in contacts:
         if _norm(vendor) == norm_folder:
             return vendor
+
+    # Flexible fallback for small naming differences:
+    # "Agra" in sheet vs "Agra Life" in staged folder (or vice versa).
+    partial_matches = [
+        vendor for vendor in contacts
+        if _norm(vendor) in norm_folder or norm_folder in _norm(vendor)
+    ]
+    if len(partial_matches) == 1:
+        return partial_matches[0]
     return None
 
 
@@ -286,15 +296,25 @@ def main() -> None:
         action="store_true",
         help="Print what would happen without touching Outlook.",
     )
+    parser.add_argument(
+        "--contacts",
+        default="",
+        help="Optional path to the contacts workbook. Defaults to 'Email Routing.xlsx'.",
+    )
     args = parser.parse_args()
 
     draft_only = not args.send
     mode_label = "DRY-RUN" if args.dry_run else ("DRAFT" if draft_only else "LIVE SEND")
     logger.info("=== Vendor Email Dispatch — %s — Mode: %s ===", args.date, mode_label)
 
-    contacts = load_contacts(CONTACTS_XLSX)
+    contacts_path = Path(args.contacts) if args.contacts else DEFAULT_CONTACTS_XLSX
+    if not contacts_path.exists() and not args.contacts and FALLBACK_CONTACTS_XLSX.exists():
+        contacts_path = FALLBACK_CONTACTS_XLSX
+        logger.info("Using fallback contacts workbook: %s", contacts_path)
+
+    contacts = load_contacts(contacts_path)
     if not contacts and not args.dry_run:
-        logger.error("No contacts loaded. Create %s first.", CONTACTS_XLSX)
+        logger.error("No contacts loaded. Create/fix %s first.", contacts_path)
         sys.exit(1)
 
     staged = scan_staging(args.date)
@@ -337,7 +357,7 @@ def main() -> None:
         logger.info("")
         logger.info(
             "Add the following names (or their sanitised equivalents) to %s:",
-            CONTACTS_XLSX,
+            contacts_path,
         )
         for s in skipped:
             logger.info("  %s", s)
