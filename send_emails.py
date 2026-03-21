@@ -61,7 +61,7 @@ SKIPPED_ARCHIVE_ROOT = EMAIL_STAGING_ROOT / "skipped"
 DEFAULT_CONTACTS_XLSX = Path("vendor_email_contacts.xlsx")
 LABEL_LOOKBACK_SECONDS = 10 * 60       # allow slight clock/save skew before order write
 LABEL_LOOKAHEAD_SECONDS = 2 * 60 * 60  # include labels created up to 2 hours after orders
-LABEL_SCAN_TIMEOUT_SECONDS = 8          # prevent one network folder from hanging the run
+LABEL_SCAN_TIMEOUT_SECONDS = 60         # prevent hangs but allow normal network folder scans
 
 FROM_NAME   = "Cornerstone Products"          # Display name shown in From field
 DEFAULT_SUBJECT_TEMPLATE = "Your Orders – {vendor} – {date}"
@@ -198,6 +198,7 @@ def _build_retailer_list(pdfs: list[Path]) -> str:
 def collect_vendor_attachments(
     contact: dict,
     staged_order_pdfs: list[Path],
+    label_scan_timeout_seconds: int,
 ) -> tuple[list[Path], int]:
     """Return (attachments, extra_count) for staged orders plus label PDFs.
 
@@ -232,14 +233,14 @@ def collect_vendor_attachments(
         window_end = float("inf")
 
     extra: list[Path] = []
-    deadline = time.monotonic() + LABEL_SCAN_TIMEOUT_SECONDS
+    deadline = time.monotonic() + max(1, int(label_scan_timeout_seconds))
     try:
         with os.scandir(labels_dir) as it:
             for entry in it:
                 if time.monotonic() > deadline:
                     logger.warning(
                         "Labels scan timed out after %ss for %s; continuing with files found so far.",
-                        LABEL_SCAN_TIMEOUT_SECONDS,
+                        max(1, int(label_scan_timeout_seconds)),
                         labels_dir,
                     )
                     break
@@ -463,6 +464,12 @@ def main() -> None:
         action="store_true",
         help="Archive all active staged PDFs for the date without sending.",
     )
+    parser.add_argument(
+        "--label-scan-timeout",
+        type=int,
+        default=LABEL_SCAN_TIMEOUT_SECONDS,
+        help="Seconds to allow label-folder scan before timing out (default: 60).",
+    )
     args = parser.parse_args()
 
     draft_only = not args.send
@@ -514,7 +521,11 @@ def main() -> None:
             continue
 
         contact = contacts[vendor]
-        attachments, extra_count = collect_vendor_attachments(contact, staged_order_pdfs)
+        attachments, extra_count = collect_vendor_attachments(
+            contact,
+            staged_order_pdfs,
+            args.label_scan_timeout,
+        )
         detail_lines.append(
             f"READY    | {vendor} | {len(staged_order_pdfs)} order PDF(s), {extra_count} label PDF(s) | {len(attachments)} total attachment(s)"
         )
