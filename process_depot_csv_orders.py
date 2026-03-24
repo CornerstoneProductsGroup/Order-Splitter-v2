@@ -35,6 +35,9 @@ INPUT_DIR = Path(
 OUTPUT_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output\CSV File Output\Depot"
 )
+WORLD_SHIP_DROP_DIR = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\zzz - Worldship Shipment Files\Cornerstone"
+)
 ARCHIVE_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
 )
@@ -347,6 +350,15 @@ def process_file(raw_csv: Path, rules: dict[str, SkuRule], output_dir: Path) -> 
         for _key, row in records:
             writer.writerow(row)
 
+    # Also write a fixed-name CSV for WorldShip import location.
+    WORLD_SHIP_DROP_DIR.mkdir(parents=True, exist_ok=True)
+    worldship_path = WORLD_SHIP_DROP_DIR / "CornerstoneMaster.csv"
+    with worldship_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(WORLD_SHIP_HEADER)
+        for _key, row in records:
+            writer.writerow(row)
+
     return out_path, len(records), unknown_skus
 
 
@@ -441,10 +453,12 @@ def main() -> None:
             )
             if args.dry_run:
                 print(f"DRY RUN: {raw_csv.name} -> would create {out_rows} output row(s)")
+                print(f"DRY RUN: would overwrite {WORLD_SHIP_DROP_DIR / 'CornerstoneMaster.csv'}")
             else:
                 assert out_path is not None
                 assert archived_to is not None
                 print(f"Processed: {raw_csv.name} -> {out_path.name} ({out_rows} rows)")
+                print(f"WorldShip: {(WORLD_SHIP_DROP_DIR / 'CornerstoneMaster.csv')}")
             if unknown_skus:
                 print(f"  Warning: {unknown_skus} row(s) had SKU not found in rules and were skipped.")
             if args.dry_run:
