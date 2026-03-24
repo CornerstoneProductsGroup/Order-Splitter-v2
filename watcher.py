@@ -1053,6 +1053,7 @@ class DepotCSVHandler(FileSystemEventHandler):
         self.dry_run = dry_run
         self.logger = logger
         self._last_seen: dict[str, float] = {}
+        self._existing_csv_mtimes_ns: dict[str, int] = {}
         self.rules: dict[str, depot_csv.SkuRule] = {}
 
         self._load_rules()
@@ -1067,21 +1068,43 @@ class DepotCSVHandler(FileSystemEventHandler):
             self.rules = {}
             self.logger.error("[Depot CSV] Could not load SKU rules from %s: %s", self.rules_path, e)
 
-    def process_pending_csvs(self, input_dir: Path) -> None:
-        """Process CSV files already present when watcher starts."""
+    def ignore_existing_csvs(self, input_dir: Path) -> None:
+        """Record existing CSVs so only new or changed files process after startup."""
         pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
         if not pending:
             self.logger.info("[Depot CSV] No existing CSV files found at startup in %s", input_dir)
             return
-        self.logger.info("[Depot CSV] Found %d existing CSV file(s) at startup", len(pending))
+
+        recorded = 0
         for fp in pending:
-            self._process_if_csv(fp, "startup")
+            try:
+                self._existing_csv_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
+                recorded += 1
+            except OSError:
+                continue
+
+        self.logger.info(
+            "[Depot CSV] Ignoring %d existing CSV file(s) at startup; only new or changed files will process",
+            recorded,
+        )
 
     def _process_if_csv(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".csv":
             return
 
         key = str(path).lower()
+        try:
+            current_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            current_mtime_ns = -1
+
+        baseline_mtime_ns = self._existing_csv_mtimes_ns.get(key)
+        if baseline_mtime_ns is not None and current_mtime_ns == baseline_mtime_ns:
+            self.logger.info("[Depot CSV] Ignoring existing startup file unchanged since watcher start: %s", path.name)
+            return
+        if baseline_mtime_ns is not None and current_mtime_ns != baseline_mtime_ns:
+            self._existing_csv_mtimes_ns.pop(key, None)
+
         now = time.monotonic()
         if now - self._last_seen.get(key, 0.0) < 10.0:
             return
@@ -1189,8 +1212,8 @@ def main() -> None:
     logger.info("[Depot CSV] Input folder exists: %s", CSV_INPUT_DIR.exists())
     logger.info("[Depot CSV] Output folder exists: %s", CSV_OUTPUT_DIR.exists())
     logger.info("[Depot CSV] Archive folder exists: %s", CSV_ARCHIVE_DIR.exists())
+    csv_handler.ignore_existing_csvs(CSV_INPUT_DIR)
     observer.schedule(csv_handler, str(CSV_INPUT_DIR), recursive=False)
-    csv_handler.process_pending_csvs(CSV_INPUT_DIR)
     logger.info("Watching [Depot CSV      ] → %s/", CSV_INPUT_DIR)
     logger.info("CSV output              → %s/", CSV_OUTPUT_DIR)
     logger.info("CSV archive             → %s/", CSV_ARCHIVE_DIR)
