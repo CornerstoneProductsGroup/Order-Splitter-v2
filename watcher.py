@@ -72,9 +72,9 @@ ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
 # email per vendor can be sent at end of day via send_emails.py.
 EMAIL_STAGING_ROOT = Path("email_staging")
 
-# Tracks the date for which the daily vendor rollup folder has already been
-# cleared during this watcher process.
-_DAILY_ROLLUP_CLEARED_FOR_DATE: str | None = None
+# Persisted state file so daily rollup is not re-cleared if watcher restarts
+# later on the same day.
+DAILY_ROLLUP_STATE_FILE = OUTPUT_ROOT / ".daily_vendor_rollup_last_cleared.txt"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (mirrors app.py)
@@ -752,15 +752,30 @@ def _stage_vendor_pdfs_for_daily_rollup(
 
 
 def _ensure_daily_rollup_current_day(logger: logging.Logger) -> None:
-    """Clear daily rollup once per calendar day before writing files."""
-    global _DAILY_ROLLUP_CLEARED_FOR_DATE
+    """Clear daily rollup once per calendar day before writing files.
 
+    Uses a small persisted state file so same-day watcher restarts do not
+    trigger another clear.
+    """
     today = datetime.date.today().isoformat()
-    if _DAILY_ROLLUP_CLEARED_FOR_DATE == today:
+
+    last_cleared = ""
+    try:
+        if DAILY_ROLLUP_STATE_FILE.exists():
+            last_cleared = DAILY_ROLLUP_STATE_FILE.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        logger.warning("Could not read daily rollup state file %s: %s", DAILY_ROLLUP_STATE_FILE, e)
+
+    if last_cleared == today:
         return
 
     _clear_directory_contents(DAILY_VENDOR_ROLLUP_ROOT, logger, "daily-rollup")
-    _DAILY_ROLLUP_CLEARED_FOR_DATE = today
+    try:
+        DAILY_ROLLUP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DAILY_ROLLUP_STATE_FILE.write_text(today, encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not write daily rollup state file %s: %s", DAILY_ROLLUP_STATE_FILE, e)
+
     logger.info("Daily rollup reset for %s", today)
 
 
