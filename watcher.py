@@ -39,6 +39,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 import pandas as pd
+import process_depot_csv_orders as depot_csv
 from pypdf import PdfReader
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -66,6 +67,19 @@ DAILY_VENDOR_ROLLUP_ROOT = Path(r"\\rygarcorp.com\shares\Cornerstone\Dot Com Pac
 ROUTES_XLSX_PATH = Path("Vendor Output Routes.xlsx")
 ROUTES_REQUIRED_COLS = ["Retailer", "Vendor"]
 ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
+
+# Depot CSV automation folders.
+CSV_INPUT_DIR = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\Depot"
+)
+CSV_OUTPUT_DIR = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output\CSV File Output\Depot"
+)
+CSV_ARCHIVE_DIR = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
+)
+CSV_RULES_XLSX_PATH = Path("Weights, Max Units and Printer for CSV routing.xlsx")
+CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 # Daily staging folder for vendor email attachments.
 # Vendor PDFs accumulate here across all retailer runs so one combined
@@ -1002,6 +1016,91 @@ class PDFHandler(FileSystemEventHandler):
         self._process_if_pdf(Path(event.src_path), "modified")
 
 
+class DepotCSVHandler(FileSystemEventHandler):
+    def __init__(
+        self,
+        rules_path: Path,
+        output_dir: Path,
+        archive_dir: Path,
+        dry_run: bool,
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__()
+        self.rules_path = rules_path
+        self.output_dir = output_dir
+        self.archive_dir = archive_dir
+        self.dry_run = dry_run
+        self.logger = logger
+        self._last_seen: dict[str, float] = {}
+        self.rules: dict[str, depot_csv.SkuRule] = {}
+
+        self._load_rules()
+
+    def _load_rules(self) -> None:
+        try:
+            self.rules = depot_csv.load_sku_rules(self.rules_path)
+            self.logger.info("[Depot CSV] Loaded %d SKU rule(s) from %s", len(self.rules), self.rules_path)
+        except Exception as e:
+            self.rules = {}
+            self.logger.error("[Depot CSV] Could not load SKU rules from %s: %s", self.rules_path, e)
+
+    def _process_if_csv(self, path: Path, event_label: str) -> None:
+        if path.suffix.lower() != ".csv":
+            return
+
+        key = str(path).lower()
+        now = time.monotonic()
+        if now - self._last_seen.get(key, 0.0) < 10.0:
+            return
+        self._last_seen[key] = now
+
+        if not self.rules:
+            self._load_rules()
+        if not self.rules:
+            self.logger.error("[Depot CSV] Rules are unavailable; skipping %s", path.name)
+            return
+
+        self.logger.info("[Depot CSV] Detected %s file: %s", event_label, path.name)
+
+        if not _wait_for_file_ready(path):
+            self.logger.error("[Depot CSV] Timed out waiting for %s to finish writing — skipping.", path.name)
+            return
+
+        try:
+            out_path, out_rows, unknown_skus, archived_to = depot_csv.process_one_csv(
+                raw_csv=path,
+                rules=self.rules,
+                output_dir=self.output_dir,
+                archive_dir=self.archive_dir,
+                dry_run=self.dry_run,
+            )
+            if self.dry_run:
+                self.logger.info("[Depot CSV] DRY RUN for %s → would create %d row(s)", path.name, out_rows)
+            else:
+                self.logger.info("[Depot CSV] Processed %s -> %s (%d rows)", path.name, out_path, out_rows)
+                self.logger.info("[Depot CSV] Archived source -> %s", archived_to)
+
+            if unknown_skus:
+                self.logger.warning("[Depot CSV] %d row(s) had unknown SKU and were sorted last", unknown_skus)
+        except Exception as e:
+            self.logger.exception("[Depot CSV] Unhandled error processing %s: %s", path.name, e)
+
+    def on_created(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_csv(Path(event.src_path), "new")
+
+    def on_moved(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_csv(Path(event.dest_path), "moved")
+
+    def on_modified(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_csv(Path(event.src_path), "modified")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1016,13 +1115,22 @@ def main() -> None:
     routes = load_vendor_output_routes(ROUTES_XLSX_PATH, logger)
     route_dirs = list({p for p in routes.values()})
 
-    if os.name != "nt" and any(str(p).startswith("\\\\") for p in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs]):
+    unc_paths = [
+        *WATCH_DIRS.values(),
+        *OUTPUT_DIRS.values(),
+        *route_dirs,
+        CSV_INPUT_DIR,
+        CSV_OUTPUT_DIR,
+        CSV_ARCHIVE_DIR,
+    ]
+
+    if os.name != "nt" and any(str(p).startswith("\\\\") for p in unc_paths):
         logger.error("UNC paths were configured, but this host is not Windows.")
         logger.error("Run watcher.py on a Windows machine that can access the network share.")
         return
 
     # Ensure all directories exist
-    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs]:
+    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs, CSV_INPUT_DIR, CSV_OUTPUT_DIR, CSV_ARCHIVE_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Reset the daily vendor rollup at startup and then once per day if the
@@ -1038,9 +1146,23 @@ def main() -> None:
         logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
         logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
 
+    csv_handler = DepotCSVHandler(
+        rules_path=CSV_RULES_XLSX_PATH,
+        output_dir=CSV_OUTPUT_DIR,
+        archive_dir=CSV_ARCHIVE_DIR,
+        dry_run=CSV_DRY_RUN,
+        logger=logger,
+    )
+    observer.schedule(csv_handler, str(CSV_INPUT_DIR), recursive=False)
+    logger.info("Watching [Depot CSV      ] → %s/", CSV_INPUT_DIR)
+    logger.info("CSV output              → %s/", CSV_OUTPUT_DIR)
+    logger.info("CSV archive             → %s/", CSV_ARCHIVE_DIR)
+    logger.info("CSV rules file          → %s", CSV_RULES_XLSX_PATH)
+    logger.info("CSV dry-run mode        → %s", CSV_DRY_RUN)
+
     logger.info("Daily rollup output     → %s/", DAILY_VENDOR_ROLLUP_ROOT)
 
-    logger.info("Watcher running. Drop PDF files into a watch folder. Press Ctrl+C to stop.\n")
+    logger.info("Watcher running. Drop PDF/CSV files into configured watch folders. Press Ctrl+C to stop.\n")
 
     observer.start()
     try:
