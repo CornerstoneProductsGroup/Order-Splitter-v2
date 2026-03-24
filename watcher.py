@@ -81,6 +81,27 @@ CSV_ARCHIVE_DIR = Path(
 CSV_RULES_XLSX_PATH = Path("Weights, Max Units and Printer for CSV routing.xlsx")
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
 
+
+def _resolve_csv_rules_path(configured_path: Path) -> Path:
+    """Resolve CSV rules path robustly for different launch working directories."""
+    candidates: list[Path] = []
+
+    if configured_path.is_absolute():
+        candidates.append(configured_path)
+    else:
+        script_dir = Path(__file__).resolve().parent
+        candidates.extend([
+            script_dir / configured_path,
+            Path.cwd() / configured_path,
+            configured_path,
+        ])
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    return candidates[0] if candidates else configured_path
+
 # Daily staging folder for vendor email attachments.
 # Vendor PDFs accumulate here across all retailer runs so one combined
 # email per vendor can be sent at end of day via send_emails.py.
@@ -1026,7 +1047,7 @@ class DepotCSVHandler(FileSystemEventHandler):
         logger: logging.Logger,
     ) -> None:
         super().__init__()
-        self.rules_path = rules_path
+        self.rules_path = _resolve_csv_rules_path(rules_path)
         self.output_dir = output_dir
         self.archive_dir = archive_dir
         self.dry_run = dry_run
@@ -1043,6 +1064,15 @@ class DepotCSVHandler(FileSystemEventHandler):
         except Exception as e:
             self.rules = {}
             self.logger.error("[Depot CSV] Could not load SKU rules from %s: %s", self.rules_path, e)
+
+    def process_pending_csvs(self, input_dir: Path) -> None:
+        """Process CSV files already present when watcher starts."""
+        pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
+        if not pending:
+            return
+        self.logger.info("[Depot CSV] Found %d existing CSV file(s) at startup", len(pending))
+        for fp in pending:
+            self._process_if_csv(fp, "startup")
 
     def _process_if_csv(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".csv":
@@ -1154,10 +1184,11 @@ def main() -> None:
         logger=logger,
     )
     observer.schedule(csv_handler, str(CSV_INPUT_DIR), recursive=False)
+    csv_handler.process_pending_csvs(CSV_INPUT_DIR)
     logger.info("Watching [Depot CSV      ] → %s/", CSV_INPUT_DIR)
     logger.info("CSV output              → %s/", CSV_OUTPUT_DIR)
     logger.info("CSV archive             → %s/", CSV_ARCHIVE_DIR)
-    logger.info("CSV rules file          → %s", CSV_RULES_XLSX_PATH)
+    logger.info("CSV rules file          → %s", csv_handler.rules_path)
     logger.info("CSV dry-run mode        → %s", CSV_DRY_RUN)
 
     logger.info("Daily rollup output     → %s/", DAILY_VENDOR_ROLLUP_ROOT)
