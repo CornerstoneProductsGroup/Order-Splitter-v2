@@ -59,6 +59,10 @@ OUTPUT_DIRS: dict[str, Path] = {
     "Tractor Supply": OUTPUT_ROOT / "Tractor Supply",
 }
 
+# Daily rollup folder (cleared when watcher starts):
+#   {root}/{VendorName}/...all vendor PDFs from all retailers for that run
+DAILY_VENDOR_ROLLUP_ROOT = Path(r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output\z- Daily Vendor Orders")
+
 ROUTES_XLSX_PATH = Path("Vendor Output Routes.xlsx")
 ROUTES_REQUIRED_COLS = ["Retailer", "Vendor"]
 ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
@@ -609,6 +613,7 @@ def build_zip(
             z.writestr(f"Needs Review/{rel_name}", data)
 
         if warehouse_print_pdf is not None:
+  
             z.writestr(f"{base} - WAREHOUSE PRINT.pdf", warehouse_print_pdf)
         for vendor, data in vendor_pdfs.items():
             safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
@@ -649,6 +654,10 @@ def write_and_route_vendor_pdfs(
     # Copy vendor PDFs into the daily email staging folder so send_emails.py
     # can combine all retailers into one email per vendor at end of day.
     _stage_vendor_pdfs_for_email(vendor_pdfs, base, retailer, logger)
+
+    # Also copy vendor PDFs into a single daily rollup folder grouped by vendor
+    # across all retailers.
+    _stage_vendor_pdfs_for_daily_rollup(vendor_pdfs, base, retailer, logger)
 
 
 def _remove_existing_routed_files_for_base(
@@ -710,6 +719,30 @@ def _stage_vendor_pdfs_for_email(
             (vendor_dir / filename).write_bytes(data)
         except OSError as e:
             logger.warning("[%s] Could not stage email PDF for vendor '%s': %s", retailer, vendor, e)
+
+
+def _stage_vendor_pdfs_for_daily_rollup(
+    vendor_pdfs: dict[str, bytes],
+    base: str,
+    retailer: str,
+    logger: logging.Logger,
+) -> None:
+    """Write vendor PDFs to one run-level rollup folder grouped by vendor.
+
+    Layout:  {DAILY_VENDOR_ROLLUP_ROOT}/{VendorName}/{base} - {retailer} - {vendor}.pdf
+    This lets each vendor folder contain that day's orders across all retailers.
+    """
+    retailer_slug = re.sub(r"[^\w]+", "_", retailer).strip("_") or "Retailer"
+
+    for vendor, data in vendor_pdfs.items():
+        safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+        vendor_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
+        try:
+            vendor_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{base} - {retailer_slug} - {safe_vendor}.pdf"
+            (vendor_dir / filename).write_bytes(data)
+        except OSError as e:
+            logger.warning("[%s] Could not write daily rollup PDF for vendor '%s': %s", retailer, vendor, e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -958,6 +991,10 @@ def main() -> None:
     for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs]:
         d.mkdir(parents=True, exist_ok=True)
 
+    # Reset the run-level daily vendor rollup so it only contains folders/files
+    # produced during the current watcher run.
+    _clear_directory_contents(DAILY_VENDOR_ROLLUP_ROOT, logger, "daily-rollup")
+
     crop_cfg = load_crop_config()
 
     observer = Observer()
@@ -966,6 +1003,8 @@ def main() -> None:
         observer.schedule(handler, str(watch_dir), recursive=False)
         logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
         logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
+
+    logger.info("Daily rollup output     → %s/", DAILY_VENDOR_ROLLUP_ROOT)
 
     logger.info("Watcher running. Drop PDF files into a watch folder. Press Ctrl+C to stop.\n")
 
