@@ -163,8 +163,16 @@ def load_sku_rules(path: Path) -> dict[str, SkuRule]:
     df = pd.read_excel(path)
 
     col_sku = _find_col(df, ["SKU"], required=True)
-    col_weight = _find_col(df, ["UnitWeight", "Weight", "EachWeight", "ItemWeight"], required=True)
-    col_max = _find_col(df, ["MaxUnitsPerBox", "MaxUnits", "Max Per Box", "UnitsPerBox"], required=True)
+    col_weight = _find_col(
+        df,
+        ["UnitWeight", "Unit Weight", "Weight", "EachWeight", "ItemWeight"],
+        required=True,
+    )
+    col_max = _find_col(
+        df,
+        ["MaxUnitsPerBox", "Max Unit per box", "MaxUnits", "Max Per Box", "UnitsPerBox"],
+        required=True,
+    )
     col_printer = _find_col(df, ["Printer", "LABEL_PRINTER_ID"], required=True)
 
     col_vendor = _find_col(df, ["VendorName", "Vendor", "Vendor Name"])
