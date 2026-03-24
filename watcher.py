@@ -1058,6 +1058,8 @@ class DepotCSVHandler(FileSystemEventHandler):
         self._load_rules()
 
     def _load_rules(self) -> None:
+        self.logger.info("[Depot CSV] Resolving rules workbook at %s", self.rules_path)
+        self.logger.info("[Depot CSV] Rules workbook exists: %s", self.rules_path.exists())
         try:
             self.rules = depot_csv.load_sku_rules(self.rules_path)
             self.logger.info("[Depot CSV] Loaded %d SKU rule(s) from %s", len(self.rules), self.rules_path)
@@ -1069,6 +1071,7 @@ class DepotCSVHandler(FileSystemEventHandler):
         """Process CSV files already present when watcher starts."""
         pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
         if not pending:
+            self.logger.info("[Depot CSV] No existing CSV files found at startup in %s", input_dir)
             return
         self.logger.info("[Depot CSV] Found %d existing CSV file(s) at startup", len(pending))
         for fp in pending:
@@ -1183,6 +1186,9 @@ def main() -> None:
         dry_run=CSV_DRY_RUN,
         logger=logger,
     )
+    logger.info("[Depot CSV] Input folder exists: %s", CSV_INPUT_DIR.exists())
+    logger.info("[Depot CSV] Output folder exists: %s", CSV_OUTPUT_DIR.exists())
+    logger.info("[Depot CSV] Archive folder exists: %s", CSV_ARCHIVE_DIR.exists())
     observer.schedule(csv_handler, str(CSV_INPUT_DIR), recursive=False)
     csv_handler.process_pending_csvs(CSV_INPUT_DIR)
     logger.info("Watching [Depot CSV      ] → %s/", CSV_INPUT_DIR)
