@@ -78,7 +78,7 @@ CSV_OUTPUT_DIR = Path(
 CSV_ARCHIVE_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
 )
-CSV_RULES_XLSX_PATH = Path("Weights, Max Units and Printer for CSV routing.xlsx")
+CSV_RULES_XLSX_PATH = Path(r"C:\OrderSplitter\Weights, Max Units and Printer for CSV routing.xlsx")
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 

@@ -39,8 +39,9 @@ ARCHIVE_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
 )
 
-# Put this rules workbook in the repo root or pass --rules with a full path.
-RULES_XLSX = Path("Weights, Max Units and Printer for CSV routing.xlsx")
+RULES_BASE_DIR = Path(r"C:\OrderSplitter")
+RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
+RULES_XLSX = RULES_BASE_DIR / RULES_FILENAME
 
 
 # Keep this header exactly as WorldShip expects.
