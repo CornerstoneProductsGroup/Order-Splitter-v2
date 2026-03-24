@@ -1137,7 +1137,7 @@ class DepotCSVHandler(FileSystemEventHandler):
                 self.logger.info("[Depot CSV] Archived source -> %s", archived_to)
 
             if unknown_skus:
-                self.logger.warning("[Depot CSV] %d row(s) had unknown SKU and were sorted last", unknown_skus)
+                self.logger.warning("[Depot CSV] %d row(s) had unknown SKU and were skipped", unknown_skus)
         except Exception as e:
             self.logger.exception("[Depot CSV] Unhandled error processing %s: %s", path.name, e)
 

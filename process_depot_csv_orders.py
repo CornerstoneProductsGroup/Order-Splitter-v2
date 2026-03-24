@@ -305,20 +305,18 @@ def process_file(raw_csv: Path, rules: dict[str, SkuRule], output_dir: Path) -> 
             base[IDX_X] = rule.printer
         else:
             unknown_skus += 1
+            continue
 
         expanded = split_row_for_labels(base, rule)
 
         for split_idx, (row_out, row_split_index) in enumerate(expanded):
-            if rule is None:
-                sort_key = (9, 9999, 10**9, source_idx, row_split_index)
-            else:
-                sort_key = (
-                    rule.label_action_order,
-                    rule.vendor_sort_order,
-                    rule.sku_order,
-                    source_idx,
-                    row_split_index,
-                )
+            sort_key = (
+                rule.label_action_order,
+                rule.vendor_sort_order,
+                rule.sku_order,
+                source_idx,
+                row_split_index,
+            )
             records.append((sort_key, row_out))
 
     records.sort(key=lambda x: x[0])
@@ -433,7 +431,7 @@ def main() -> None:
                 assert archived_to is not None
                 print(f"Processed: {raw_csv.name} -> {out_path.name} ({out_rows} rows)")
             if unknown_skus:
-                print(f"  Warning: {unknown_skus} row(s) had SKU not found in rules and were sorted last.")
+                print(f"  Warning: {unknown_skus} row(s) had SKU not found in rules and were skipped.")
             if args.dry_run:
                 print("Archived:  (skipped in dry-run)")
             else:
