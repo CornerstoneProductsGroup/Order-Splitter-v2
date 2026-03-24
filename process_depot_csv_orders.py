@@ -145,6 +145,19 @@ def _fmt_number(value: float) -> str:
     return f"{value:.3f}".rstrip("0").rstrip(".")
 
 
+def _normalize_postal_code(postal_code: str, country_code: str) -> str:
+    postal = _norm_text(postal_code)
+    country = _norm_text(country_code).upper()
+
+    # Preserve leading-zero ZIP codes for US addresses.
+    if country == "US":
+        digits_only = re.sub(r"\D", "", postal)
+        if digits_only and len(digits_only) < 5:
+            return digits_only.zfill(5)
+
+    return postal
+
+
 def _find_col(df: pd.DataFrame, candidates: list[str], required: bool = False) -> str | None:
     normalized = {str(c).strip().lower(): c for c in df.columns}
     for c in candidates:
@@ -231,6 +244,8 @@ def build_base_output_row(raw_row: list[str]) -> list[str]:
     b_to_v = raw_row[1:22] + [""] * max(0, 21 - len(raw_row[1:22]))
     out = [""] * 31
     out[0:21] = b_to_v[:21]
+
+    out[6] = _normalize_postal_code(out[6], out[7])
 
     # Constants
     out[IDX_W] = "8119"
