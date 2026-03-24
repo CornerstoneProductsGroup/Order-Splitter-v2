@@ -72,6 +72,10 @@ ROUTES_PATH_COL_CANDIDATES = ["DestinationPath", "Path"]
 # email per vendor can be sent at end of day via send_emails.py.
 EMAIL_STAGING_ROOT = Path("email_staging")
 
+# Tracks the date for which the daily vendor rollup folder has already been
+# cleared during this watcher process.
+_DAILY_ROLLUP_CLEARED_FOR_DATE: str | None = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config  (mirrors app.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -732,6 +736,8 @@ def _stage_vendor_pdfs_for_daily_rollup(
     Layout:  {DAILY_VENDOR_ROLLUP_ROOT}/{VendorName}/{base} - {retailer} - {vendor}.pdf
     This lets each vendor folder contain that day's orders across all retailers.
     """
+    _ensure_daily_rollup_current_day(logger)
+
     retailer_slug = re.sub(r"[^\w]+", "_", retailer).strip("_") or "Retailer"
 
     for vendor, data in vendor_pdfs.items():
@@ -743,6 +749,19 @@ def _stage_vendor_pdfs_for_daily_rollup(
             (vendor_dir / filename).write_bytes(data)
         except OSError as e:
             logger.warning("[%s] Could not write daily rollup PDF for vendor '%s': %s", retailer, vendor, e)
+
+
+def _ensure_daily_rollup_current_day(logger: logging.Logger) -> None:
+    """Clear daily rollup once per calendar day before writing files."""
+    global _DAILY_ROLLUP_CLEARED_FOR_DATE
+
+    today = datetime.date.today().isoformat()
+    if _DAILY_ROLLUP_CLEARED_FOR_DATE == today:
+        return
+
+    _clear_directory_contents(DAILY_VENDOR_ROLLUP_ROOT, logger, "daily-rollup")
+    _DAILY_ROLLUP_CLEARED_FOR_DATE = today
+    logger.info("Daily rollup reset for %s", today)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -991,9 +1010,9 @@ def main() -> None:
     for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # Reset the run-level daily vendor rollup so it only contains folders/files
-    # produced during the current watcher run.
-    _clear_directory_contents(DAILY_VENDOR_ROLLUP_ROOT, logger, "daily-rollup")
+    # Reset the daily vendor rollup at startup and then once per day if the
+    # watcher remains running across midnight.
+    _ensure_daily_rollup_current_day(logger)
 
     crop_cfg = load_crop_config()
 
