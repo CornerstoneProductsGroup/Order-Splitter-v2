@@ -368,7 +368,7 @@ def archive_source(raw_csv: Path, archive_dir: Path) -> Path:
     if target.exists():
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         target = archive_dir / f"{raw_csv.stem}_{stamp}{raw_csv.suffix}"
-    shutil.move(str(raw_csv), str(target))
+    shutil.copy2(str(raw_csv), str(target))
     return target
 
 
@@ -464,7 +464,7 @@ def main() -> None:
             if args.dry_run:
                 print("Archived:  (skipped in dry-run)")
             else:
-                print(f"Archived:  {archived_to}")
+                print(f"Archived copy:  {archived_to}")
         except Exception as e:
             print(f"Failed: {raw_csv.name} -> {e}")
 

@@ -1134,7 +1134,7 @@ class DepotCSVHandler(FileSystemEventHandler):
                 self.logger.info("[Depot CSV] DRY RUN for %s → would create %d row(s)", path.name, out_rows)
             else:
                 self.logger.info("[Depot CSV] Processed %s -> %s (%d rows)", path.name, out_path, out_rows)
-                self.logger.info("[Depot CSV] Archived source -> %s", archived_to)
+                self.logger.info("[Depot CSV] Archived copy -> %s", archived_to)
 
             if unknown_skus:
                 self.logger.warning("[Depot CSV] %d row(s) had unknown SKU and were skipped", unknown_skus)
