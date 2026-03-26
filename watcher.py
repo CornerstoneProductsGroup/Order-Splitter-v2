@@ -78,7 +78,8 @@ CSV_OUTPUT_DIR = Path(
 CSV_ARCHIVE_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
 )
-CSV_RULES_XLSX_PATH = Path(r"C:\OrderSplitter\Weights, Max Units and Printer for CSV routing.xlsx")
+CSV_RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
+CSV_RULES_XLSX_PATH = Path(CSV_RULES_FILENAME)
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 
@@ -86,15 +87,18 @@ def _resolve_csv_rules_path(configured_path: Path) -> Path:
     """Resolve CSV rules path robustly for different launch working directories."""
     candidates: list[Path] = []
 
+    script_dir = Path(__file__).resolve().parent
+
     if configured_path.is_absolute():
         candidates.append(configured_path)
-    else:
-        script_dir = Path(__file__).resolve().parent
-        candidates.extend([
-            script_dir / configured_path,
-            Path.cwd() / configured_path,
-            configured_path,
-        ])
+
+    # Prefer the workbook that lives with this app repository.
+    candidates.extend([
+        script_dir / configured_path,
+        Path.cwd() / configured_path,
+        Path(r"C:\OrderSplitter") / CSV_RULES_FILENAME,
+        configured_path,
+    ])
 
     for p in candidates:
         if p.exists():

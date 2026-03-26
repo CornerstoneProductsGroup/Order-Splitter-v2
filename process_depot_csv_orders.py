@@ -42,9 +42,10 @@ ARCHIVE_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
 )
 
-RULES_BASE_DIR = Path(r"C:\OrderSplitter")
+
+# Use the rules file from the local project directory by default
 RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
-RULES_XLSX = RULES_BASE_DIR / RULES_FILENAME
+RULES_XLSX = Path(__file__).parent / RULES_FILENAME
 
 
 # Keep this header exactly as WorldShip expects.
@@ -238,6 +239,11 @@ def load_sku_rules(path: Path) -> dict[str, SkuRule]:
 
     if not rules:
         raise ValueError(f"No SKU rules loaded from {path}")
+
+    # Debug: Print all loaded SKUs
+    print(f"Loaded {len(rules)} SKUs from rules file: {path}")
+    for sku in sorted(rules.keys()):
+        print(f"  SKU: {sku}")
 
     return rules
 
