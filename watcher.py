@@ -78,6 +78,19 @@ CSV_OUTPUT_DIR = Path(
 CSV_ARCHIVE_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
 )
+
+# WorldShip label input: one subfolder **per vendor** under this root.
+#   e.g.  …\5-WorldShip Labels\Post Protector\shipment_label.pdf
+# The watcher watches all vendor subfolders recursively; the vendor name
+# is taken from the immediate parent folder of each dropped PDF.
+LABEL_WATCH_ROOT = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\5-WorldShip Labels"
+)
+LABEL_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_LABEL_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
+
+# Output size for a thermal 4×6 label (in PDF points at 72 pt/in).
+LABEL_OUTPUT_WIDTH_PT  = 4.0 * 72   # 288 pt
+LABEL_OUTPUT_HEIGHT_PT = 6.0 * 72   # 432 pt
 CSV_RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
 CSV_RULES_XLSX_PATH = Path(CSV_RULES_FILENAME)
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
@@ -337,6 +350,43 @@ def _fit_rect_contain(dst_w: float, dst_h: float, src_w: float, src_h: float) ->
     x0 = (dst_w - w) / 2.0
     y0 = (dst_h - h) / 2.0
     return fitz.Rect(x0, y0, x0 + w, y0 + h)
+
+
+def resize_thermal_label_pdf(pdf_bytes: bytes) -> bytes:
+    """Crop a 4×6 thermal label off each page of an 8.5×11 PDF and re-pack it
+    onto a proper 4×6 page (288×432 pt).
+
+    Uses the same auto-content-detect approach as the Lowe's SOS tag resize so
+    no manual coordinate configuration is needed — the label is auto-detected
+    from its own vector content no matter where on the source page it appears.
+    """
+    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out_doc = fitz.open()
+
+    for i in range(src_doc.page_count):
+        src_page = src_doc.load_page(i)
+
+        # Auto-detect bounds; fall back to full page if nothing is found.
+        clip = _auto_content_rect(src_page)
+        if clip is None:
+            clip = src_page.rect
+
+        # Render at 3× for sharp output at 4×6 physical size.
+        pix = src_page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=clip, alpha=False)
+
+        page = out_doc.new_page(width=LABEL_OUTPUT_WIDTH_PT, height=LABEL_OUTPUT_HEIGHT_PT)
+        img_rect = _fit_rect_contain(
+            LABEL_OUTPUT_WIDTH_PT, LABEL_OUTPUT_HEIGHT_PT,
+            float(pix.width), float(pix.height),
+        )
+        page.insert_image(img_rect, pixmap=pix)
+
+    buf = BytesIO()
+    out_doc.save(buf)
+    out_doc.close()
+    src_doc.close()
+    return buf.getvalue()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core processing helpers  (exact copies of the logic in app.py)
@@ -792,6 +842,30 @@ def _stage_vendor_pdfs_for_daily_rollup(
             logger.warning("[%s] Could not write daily rollup PDF for vendor '%s': %s", retailer, vendor, e)
 
 
+def _stage_label_for_daily_rollup(
+    vendor: str,
+    label_data: bytes,
+    filename: str,
+    logger: logging.Logger,
+) -> None:
+    """Write a resized label PDF to the daily rollup folder for the given vendor.
+
+    Layout:  {DAILY_VENDOR_ROLLUP_ROOT}/{VendorName}/{filename}
+    The label sits alongside the order PDFs in the vendor folder so both can be
+    selected when sending the daily vendor email.
+    """
+    _ensure_daily_rollup_current_day(logger)
+    safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+    vendor_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
+    try:
+        vendor_dir.mkdir(parents=True, exist_ok=True)
+        dest = vendor_dir / filename
+        dest.write_bytes(label_data)
+        logger.info("[Labels] Resized label → %s", dest)
+    except OSError as e:
+        logger.warning("[Labels] Could not write label for vendor '%s': %s", vendor, e)
+
+
 def _ensure_daily_rollup_current_day(logger: logging.Logger) -> None:
     """Clear daily rollup once per calendar day before writing files.
 
@@ -1237,6 +1311,134 @@ class DepotCSVHandler(FileSystemEventHandler):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# WorldShip label handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LabelHandler(FileSystemEventHandler):
+    """Watch vendor subfolders under LABEL_WATCH_ROOT for WorldShip label PDFs.
+
+    Drop a label PDF into  LABEL_WATCH_ROOT/{VendorName}/label.pdf  and it
+    will be auto-cropped from 8.5×11 down to a proper 4×6 page, then written
+    alongside the order PDFs in  DAILY_VENDOR_ROLLUP_ROOT/{VendorName}/.
+    """
+
+    def __init__(self, logger: logging.Logger) -> None:
+        super().__init__()
+        self.logger = logger
+        self._last_seen: dict[str, float] = {}
+        self._existing_label_mtimes_ns: dict[str, int] = {}
+        self._poll_interval_sec = 5.0
+        self._next_poll_at = 0.0
+        self._next_poll_log_at = 0.0
+
+    def ignore_existing_labels(self, watch_root: Path) -> None:
+        """Snapshot all existing label PDFs so only newly-added files process."""
+        try:
+            pending = list(watch_root.rglob("*.pdf"))
+        except Exception:
+            return
+        recorded = 0
+        for fp in pending:
+            try:
+                self._existing_label_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
+                recorded += 1
+            except OSError:
+                continue
+        if recorded:
+            self.logger.info("[Labels] Ignoring %d existing label PDF(s) at startup", recorded)
+
+    def _vendor_from_path(self, path: Path) -> str:
+        """Return the vendor name from the file's immediate parent folder."""
+        # Expected layout: LABEL_WATCH_ROOT/{VendorName}/{file.pdf}
+        vendor = path.parent.name.strip()
+        return vendor if vendor else "UNKNOWN"
+
+    def _process_if_label(self, path: Path, event_label: str) -> None:
+        if path.suffix.lower() != ".pdf":
+            return
+
+        key = str(path).lower()
+        try:
+            current_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            current_mtime_ns = -1
+
+        baseline_mtime_ns = self._existing_label_mtimes_ns.get(key)
+        if baseline_mtime_ns is not None and current_mtime_ns == baseline_mtime_ns:
+            return  # unchanged since startup — skip silently
+        if baseline_mtime_ns is not None and current_mtime_ns != baseline_mtime_ns:
+            self._existing_label_mtimes_ns.pop(key, None)
+
+        now = time.monotonic()
+        if now - self._last_seen.get(key, 0.0) < 10.0:
+            return
+        self._last_seen[key] = now
+
+        if not _wait_for_file_ready(path):
+            self.logger.error("[Labels] Timed out waiting for %s to finish writing — skipping.", path.name)
+            return
+
+        vendor = self._vendor_from_path(path)
+        self.logger.info("[Labels] Detected %s label for vendor '%s': %s", event_label, vendor, path.name)
+
+        try:
+            pdf_bytes = path.read_bytes()
+        except OSError as e:
+            self.logger.error("[Labels] Cannot read %s: %s", path.name, e)
+            return
+
+        try:
+            resized_bytes = resize_thermal_label_pdf(pdf_bytes)
+        except Exception as e:
+            self.logger.exception("[Labels] Error resizing %s: %s", path.name, e)
+            return
+
+        # Preserve the original filename so it's identifiable in the vendor folder.
+        stem = re.sub(r"\.pdf$", "", path.name, flags=re.IGNORECASE)
+        out_filename = f"{stem}_LABEL.pdf"
+        _stage_label_for_daily_rollup(vendor, resized_bytes, out_filename, self.logger)
+
+    def poll_label_root(self, watch_root: Path) -> None:
+        """Polling fallback for network shares where file-system events can be missed."""
+        now = time.monotonic()
+        if now < self._next_poll_at:
+            return
+        self._next_poll_at = now + self._poll_interval_sec
+
+        try:
+            pending = list(watch_root.rglob("*.pdf"))
+        except Exception as e:
+            self.logger.error("[Labels] Poll failed for %s: %s", watch_root, e)
+            return
+
+        if now >= self._next_poll_log_at:
+            self._next_poll_log_at = now + 60.0
+            self.logger.info(
+                "[Labels] Poll heartbeat: %d label PDF(s) visible under %s",
+                len(pending),
+                watch_root,
+            )
+
+        for fp in pending:
+            self._process_if_label(fp, "polled")
+
+    def on_created(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_label(Path(event.src_path), "new")
+
+    def on_moved(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_label(Path(event.dest_path), "moved")
+
+    def on_modified(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_label(Path(event.src_path), "modified")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1257,6 +1459,7 @@ def main() -> None:
         CSV_INPUT_DIR,
         CSV_OUTPUT_DIR,
         CSV_ARCHIVE_DIR,
+        LABEL_WATCH_ROOT,
     ]
 
     if os.name != "nt" and any(str(p).startswith("\\\\") for p in unc_paths):
@@ -1265,7 +1468,7 @@ def main() -> None:
         return
 
     # Ensure all directories exist
-    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs, CSV_INPUT_DIR, CSV_OUTPUT_DIR, CSV_ARCHIVE_DIR]:
+    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs, CSV_INPUT_DIR, CSV_OUTPUT_DIR, CSV_ARCHIVE_DIR, LABEL_WATCH_ROOT]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Reset the daily vendor rollup at startup and then once per day if the
@@ -1276,8 +1479,8 @@ def main() -> None:
 
     observer = Observer()
 
-    if not PDF_WATCH_ENABLED and not CSV_WATCH_ENABLED:
-        logger.error("Both PDF and CSV watchers are disabled by environment settings.")
+    if not PDF_WATCH_ENABLED and not CSV_WATCH_ENABLED and not LABEL_WATCH_ENABLED:
+        logger.error("All PDF, CSV, and Label watchers are disabled by environment settings.")
         return
 
     if PDF_WATCH_ENABLED:
@@ -1312,6 +1515,19 @@ def main() -> None:
     else:
         logger.info("CSV watcher disabled by ORDER_SPLITTER_DISABLE_CSV_WATCH")
 
+    label_handler: LabelHandler | None = None
+    if PDF_WATCH_ENABLED and LABEL_WATCH_ENABLED:
+        label_handler = LabelHandler(logger)
+        label_handler.ignore_existing_labels(LABEL_WATCH_ROOT)
+        observer.schedule(label_handler, str(LABEL_WATCH_ROOT), recursive=True)
+        logger.info("Watching [Labels        ] → %s/ (recursive)", LABEL_WATCH_ROOT)
+        logger.info("Label output            → %s/{VendorName}/", DAILY_VENDOR_ROLLUP_ROOT)
+        logger.info("Label output size       → 4×6 inches (%.0f×%.0f pt)", LABEL_OUTPUT_WIDTH_PT, LABEL_OUTPUT_HEIGHT_PT)
+    elif not PDF_WATCH_ENABLED:
+        logger.info("Label watcher skipped (requires PDF watcher to be enabled)")
+    else:
+        logger.info("Label watcher disabled by ORDER_SPLITTER_DISABLE_LABEL_WATCH")
+
     logger.info("Daily rollup output     → %s/", DAILY_VENDOR_ROLLUP_ROOT)
 
     logger.info("Watcher running. Drop PDF/CSV files into configured watch folders. Press Ctrl+C to stop.\n")
@@ -1321,6 +1537,8 @@ def main() -> None:
         while True:
             if csv_handler is not None:
                 csv_handler.poll_input_dir(CSV_INPUT_DIR)
+            if label_handler is not None:
+                label_handler.poll_label_root(LABEL_WATCH_ROOT)
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
