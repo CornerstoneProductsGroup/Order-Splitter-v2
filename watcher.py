@@ -1016,6 +1016,25 @@ def _wait_for_file_ready(path: Path, stable_secs: float = 1.0, timeout_secs: flo
     return False
 
 
+def _file_signature(path: Path) -> tuple[int, int, int] | None:
+    """Return a file identity signature used for startup-baseline comparisons.
+
+    Signature fields:
+      1) mtime_ns
+      2) size bytes
+      3) ctime_ns
+
+    This lets us ignore exact files that already existed at startup, while still
+    processing files newly copied into the folder even if they carry an old
+    modified time.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (int(st.st_mtime_ns), int(st.st_size), int(st.st_ctime_ns))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main processing function
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1171,7 +1190,7 @@ class PDFHandler(FileSystemEventHandler):
         self.routes = routes
         self.logger    = logger
         self._last_seen: dict[str, float] = {}
-        self._existing_pdf_mtimes_ns: dict[str, int] = {}
+        self._existing_pdf_signatures: dict[str, tuple[int, int, int]] = {}
 
     def ignore_existing_pdfs(self, input_dir: Path) -> None:
         """Record existing PDFs so only new/changed-after-start files process."""
@@ -1182,11 +1201,11 @@ class PDFHandler(FileSystemEventHandler):
 
         recorded = 0
         for fp in pending:
-            try:
-                self._existing_pdf_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
-                recorded += 1
-            except OSError:
+            sig = _file_signature(fp)
+            if sig is None:
                 continue
+            self._existing_pdf_signatures[str(fp).lower()] = sig
+            recorded += 1
 
         self.logger.info(
             "[%s] Ignoring %d existing PDF file(s) at startup; only new/changed files will process",
@@ -1199,17 +1218,13 @@ class PDFHandler(FileSystemEventHandler):
             return
 
         key = str(path).lower()
-        try:
-            current_mtime_ns = path.stat().st_mtime_ns
-        except OSError:
-            current_mtime_ns = -1
-
-        baseline_mtime_ns = self._existing_pdf_mtimes_ns.get(key)
-        if baseline_mtime_ns is not None and current_mtime_ns == baseline_mtime_ns:
+        current_sig = _file_signature(path)
+        baseline_sig = self._existing_pdf_signatures.get(key)
+        if baseline_sig is not None and current_sig == baseline_sig:
             self.logger.info("[%s] Ignoring existing startup file unchanged since watcher start: %s", self.retailer, path.name)
             return
-        if baseline_mtime_ns is not None and current_mtime_ns != baseline_mtime_ns:
-            self._existing_pdf_mtimes_ns.pop(key, None)
+        if baseline_sig is not None and current_sig != baseline_sig:
+            self._existing_pdf_signatures.pop(key, None)
 
         now = time.monotonic()
         if now - self._last_seen.get(key, 0.0) < 10.0:
@@ -1265,7 +1280,7 @@ class DepotCSVHandler(FileSystemEventHandler):
         self.dry_run = dry_run
         self.logger = logger
         self._last_seen: dict[str, float] = {}
-        self._existing_csv_mtimes_ns: dict[str, int] = {}
+        self._existing_csv_signatures: dict[str, tuple[int, int, int]] = {}
         self.rules: dict[str, depot_csv.SkuRule] = {}
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
@@ -1301,12 +1316,11 @@ class DepotCSVHandler(FileSystemEventHandler):
 
         recorded = 0
         for fp in pending:
-            try:
-                st = fp.stat()
-                self._existing_csv_mtimes_ns[str(fp).lower()] = st.st_mtime_ns
-                recorded += 1
-            except OSError:
+            sig = _file_signature(fp)
+            if sig is None:
                 continue
+            self._existing_csv_signatures[str(fp).lower()] = sig
+            recorded += 1
 
         self.logger.info(
             "[Depot CSV] Ignoring %d existing CSV file(s) at startup; only new/changed files will process",
@@ -1318,17 +1332,13 @@ class DepotCSVHandler(FileSystemEventHandler):
             return
 
         key = str(path).lower()
-        try:
-            current_mtime_ns = path.stat().st_mtime_ns
-        except OSError:
-            current_mtime_ns = -1
-
-        baseline_mtime_ns = self._existing_csv_mtimes_ns.get(key)
-        if baseline_mtime_ns is not None and current_mtime_ns == baseline_mtime_ns:
+        current_sig = _file_signature(path)
+        baseline_sig = self._existing_csv_signatures.get(key)
+        if baseline_sig is not None and current_sig == baseline_sig:
             self.logger.info("[Depot CSV] Ignoring existing startup file unchanged since watcher start: %s", path.name)
             return
-        if baseline_mtime_ns is not None and current_mtime_ns != baseline_mtime_ns:
-            self._existing_csv_mtimes_ns.pop(key, None)
+        if baseline_sig is not None and current_sig != baseline_sig:
+            self._existing_csv_signatures.pop(key, None)
 
         now = time.monotonic()
         if now - self._last_seen.get(key, 0.0) < 10.0:
@@ -1431,7 +1441,7 @@ class LabelHandler(FileSystemEventHandler):
         self.routes = routes
         self.logger = logger
         self._last_seen: dict[str, float] = {}
-        self._existing_label_mtimes_ns: dict[str, int] = {}
+        self._existing_label_signatures: dict[str, tuple[int, int, int]] = {}
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
@@ -1469,11 +1479,11 @@ class LabelHandler(FileSystemEventHandler):
         for scan_root in paths_to_scan:
             try:
                 for fp in scan_root.rglob("*.pdf"):
-                    try:
-                        self._existing_label_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
-                        recorded += 1
-                    except OSError:
+                    sig = _file_signature(fp)
+                    if sig is None:
                         continue
+                    self._existing_label_signatures[str(fp).lower()] = sig
+                    recorded += 1
             except Exception:
                 continue
 
@@ -1485,16 +1495,12 @@ class LabelHandler(FileSystemEventHandler):
             return
 
         key = str(path).lower()
-        try:
-            current_mtime_ns = path.stat().st_mtime_ns
-        except OSError:
-            current_mtime_ns = -1
-
-        baseline_mtime_ns = self._existing_label_mtimes_ns.get(key)
-        if baseline_mtime_ns is not None and current_mtime_ns == baseline_mtime_ns:
+        current_sig = _file_signature(path)
+        baseline_sig = self._existing_label_signatures.get(key)
+        if baseline_sig is not None and current_sig == baseline_sig:
             return  # unchanged since startup — skip silently
-        if baseline_mtime_ns is not None and current_mtime_ns != baseline_mtime_ns:
-            self._existing_label_mtimes_ns.pop(key, None)
+        if baseline_sig is not None and current_sig != baseline_sig:
+            self._existing_label_signatures.pop(key, None)
 
         now = time.monotonic()
         if now - self._last_seen.get(key, 0.0) < 10.0:
