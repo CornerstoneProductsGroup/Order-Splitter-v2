@@ -95,10 +95,11 @@ LABEL_OUTPUT_WIDTH_PT  = 4.0 * 72   # 288 pt
 LABEL_OUTPUT_HEIGHT_PT = 6.0 * 72   # 432 pt
 
 # Spreadsheet that configures per-vendor label input/output paths and label size.
-# Expected columns: Vendor | InputPath | OutputPath | LabelSize
-# LabelSize values: "4x6"  → crop to thermal 4×6
-#                   "8x11" → pass through at original size (no resize)
-LABEL_ROUTES_XLSX_PATH = Path("Label Vendor Routes.xlsx")
+# Columns: Retailer | Vendor | Input | Output | Sizing
+# Sizing values: "4x6"  → crop to thermal 4×6
+#                "8x11" → pass through at original size (no resize)
+# Rows with blank Input or Output are skipped (placeholders for future retailers).
+LABEL_ROUTES_XLSX_PATH = Path("Vendor Label Paths (Input-Output).xlsx")
 CSV_RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
 CSV_RULES_XLSX_PATH = Path(CSV_RULES_FILENAME)
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
@@ -118,8 +119,9 @@ class LabelVendorRoute:
 def load_label_vendor_routes(xlsx_path: Path, logger: logging.Logger) -> list[LabelVendorRoute]:
     """Load per-vendor label routing config from the xlsx spreadsheet.
 
-    Required columns: Vendor, InputPath, OutputPath, LabelSize
-    LabelSize: "4x6" → resize to thermal; "8x11" → no resize.
+    Required columns: Retailer, Vendor, Input, Output, Sizing
+    Sizing: "4x6" → resize to thermal; "8x11" → no resize.
+    Rows with blank Input or Output are skipped.
     Returns an empty list if the file is missing or cannot be parsed.
     """
     if not xlsx_path.exists():
@@ -137,7 +139,7 @@ def load_label_vendor_routes(xlsx_path: Path, logger: logging.Logger) -> list[La
         logger.error("[Labels] Could not read routes workbook %s: %s", xlsx_path, e)
         return []
 
-    required = {"Vendor", "InputPath", "OutputPath", "LabelSize"}
+    required = {"Vendor", "Input", "Output", "Sizing"}
     missing = required - set(df.columns)
     if missing:
         logger.error("[Labels] Routes workbook missing columns: %s", missing)
@@ -146,20 +148,25 @@ def load_label_vendor_routes(xlsx_path: Path, logger: logging.Logger) -> list[La
     routes: list[LabelVendorRoute] = []
     for _, row in df.iterrows():
         vendor = str(row.get("Vendor", "") or "").strip()
-        input_raw = str(row.get("InputPath", "") or "").strip()
-        output_raw = str(row.get("OutputPath", "") or "").strip()
-        size_raw = str(row.get("LabelSize", "") or "").strip().lower()
+        input_raw = str(row.get("Input", "") or "").strip()
+        output_raw = str(row.get("Output", "") or "").strip()
+        size_raw = str(row.get("Sizing", "") or "").strip().lower()
 
+        # Skip blank/placeholder rows (e.g. Lowe's/TSC vendors not yet configured).
         if not vendor or not input_raw or not output_raw or not size_raw:
+            continue
+        if input_raw.lower() == "nan" or output_raw.lower() == "nan":
             continue
 
         resize = "8x11" not in size_raw  # anything other than 8x11 gets resized
+        retailer = str(row.get("Retailer", "") or "").strip()
         routes.append(LabelVendorRoute(
             vendor=vendor,
             input_path=Path(input_raw),
             output_path=Path(output_raw),
             resize=resize,
         ))
+        logger.debug("[Labels] Route: [%s] %s → %s (%s)", retailer, vendor, output_raw, "4x6" if resize else "8x11")
 
     logger.info("[Labels] Loaded %d vendor route(s) from %s", len(routes), xlsx_path)
     return routes
