@@ -1061,6 +1061,7 @@ class DepotCSVHandler(FileSystemEventHandler):
         self.rules: dict[str, depot_csv.SkuRule] = {}
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
+        self._next_poll_log_at = 0.0
 
         self._load_rules()
 
@@ -1096,7 +1097,10 @@ class DepotCSVHandler(FileSystemEventHandler):
         for fp in pending:
             try:
                 st = fp.stat()
-                file_day = datetime.datetime.fromtimestamp(st.st_mtime).date()
+                # Some download workflows preserve original mtime from source;
+                # include ctime so newly dropped files aren't treated as historical.
+                recent_ts = max(st.st_mtime, st.st_ctime)
+                file_day = datetime.datetime.fromtimestamp(recent_ts).date()
                 if file_day == today:
                     # Keep today's files eligible for immediate processing.
                     will_process_now += 1
@@ -1183,6 +1187,15 @@ class DepotCSVHandler(FileSystemEventHandler):
         except Exception as e:
             self.logger.error("[Depot CSV] Poll failed for %s: %s", input_dir, e)
             return
+
+        if now >= self._next_poll_log_at:
+            self._next_poll_log_at = now + 60.0
+            self.logger.info(
+                "[Depot CSV] Poll heartbeat: %d CSV file(s) visible in %s (rules loaded: %d)",
+                len(pending),
+                input_dir,
+                len(self.rules),
+            )
 
         for fp in pending:
             self._process_if_csv(fp, "polled")
