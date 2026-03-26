@@ -1059,6 +1059,8 @@ class DepotCSVHandler(FileSystemEventHandler):
         self._last_seen: dict[str, float] = {}
         self._existing_csv_mtimes_ns: dict[str, int] = {}
         self.rules: dict[str, depot_csv.SkuRule] = {}
+        self._poll_interval_sec = 5.0
+        self._next_poll_at = 0.0
 
         self._load_rules()
 
@@ -1155,6 +1157,22 @@ class DepotCSVHandler(FileSystemEventHandler):
         except Exception as e:
             self.logger.exception("[Depot CSV] Unhandled error processing %s: %s", path.name, e)
 
+    def poll_input_dir(self, input_dir: Path) -> None:
+        """Fallback polling for network shares where file events can be missed."""
+        now = time.monotonic()
+        if now < self._next_poll_at:
+            return
+        self._next_poll_at = now + self._poll_interval_sec
+
+        try:
+            pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
+        except Exception as e:
+            self.logger.error("[Depot CSV] Poll failed for %s: %s", input_dir, e)
+            return
+
+        for fp in pending:
+            self._process_if_csv(fp, "polled")
+
     def on_created(self, event) -> None:  # type: ignore[override]
         if event.is_directory:
             return
@@ -1241,6 +1259,7 @@ def main() -> None:
     observer.start()
     try:
         while True:
+            csv_handler.poll_input_dir(CSV_INPUT_DIR)
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
