@@ -803,6 +803,8 @@ def write_and_route_vendor_pdfs(
 ) -> None:
     base = re.sub(r"\.pdf$", "", base_name, flags=re.IGNORECASE).strip()
     base = re.sub(r"[\\/:*?\"<>|]+", "_", base).strip() or "Orders"
+    today = datetime.date.today().isoformat()
+    safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
     unmapped_dir = output_dir / "Unmapped Vendor Routes"
 
     # If this same source file name is re-run, remove previous routed outputs first
@@ -811,7 +813,7 @@ def write_and_route_vendor_pdfs(
 
     for vendor, data in vendor_pdfs.items():
         safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
-        filename = f"{base} - {safe_vendor}.pdf"
+        filename = f"{safe_retailer} {safe_vendor} {today} ORDER.pdf"
 
         route_dir = resolve_route_path(routes, retailer, vendor)
         if route_dir is None:
@@ -880,13 +882,14 @@ def _stage_vendor_pdfs_for_email(
     with all retailers' attachments combined.
     """
     today = datetime.date.today().isoformat()   # e.g. "2026-03-20"
+    safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
 
     for vendor, data in vendor_pdfs.items():
         safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
         vendor_dir = EMAIL_STAGING_ROOT / today / safe_vendor
         try:
             vendor_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{base} - {safe_vendor}.pdf"
+            filename = f"{safe_retailer} {safe_vendor} {today} ORDER.pdf"
             (vendor_dir / filename).write_bytes(data)
         except OSError as e:
             logger.warning("[%s] Could not stage email PDF for vendor '%s': %s", retailer, vendor, e)
@@ -905,14 +908,15 @@ def _stage_vendor_pdfs_for_daily_rollup(
     """
     _ensure_daily_rollup_current_day(logger)
 
-    retailer_slug = re.sub(r"[^\w]+", "_", retailer).strip("_") or "Retailer"
+    today = datetime.date.today().isoformat()
+    safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
 
     for vendor, data in vendor_pdfs.items():
         safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
         vendor_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
         try:
             vendor_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{base} - {retailer_slug} - {safe_vendor}.pdf"
+            filename = f"{safe_retailer} {safe_vendor} {today} ORDER.pdf"
             (vendor_dir / filename).write_bytes(data)
         except OSError as e:
             logger.warning("[%s] Could not write daily rollup PDF for vendor '%s': %s", retailer, vendor, e)
@@ -940,7 +944,7 @@ def _stage_label_for_daily_rollup(
 
     safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
     today = datetime.date.today().isoformat()
-    combined_name = f"{safe_vendor} {safe_retailer} {today}.pdf"
+    combined_name = f"{safe_retailer} {safe_vendor} {today} LABEL.pdf"
     combined_path = output_dir / combined_name
     try:
         if combined_path.exists():
