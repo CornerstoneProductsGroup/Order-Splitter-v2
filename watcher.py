@@ -1066,11 +1066,20 @@ class DepotCSVHandler(FileSystemEventHandler):
         self.logger.info("[Depot CSV] Resolving rules workbook at %s", self.rules_path)
         self.logger.info("[Depot CSV] Rules workbook exists: %s", self.rules_path.exists())
         try:
-            self.rules = depot_csv.load_sku_rules(self.rules_path)
+            loaded_rules = depot_csv.load_sku_rules(self.rules_path)
+            self.rules = loaded_rules
             self.logger.info("[Depot CSV] Loaded %d SKU rule(s) from %s", len(self.rules), self.rules_path)
         except Exception as e:
-            self.rules = {}
-            self.logger.error("[Depot CSV] Could not load SKU rules from %s: %s", self.rules_path, e)
+            if self.rules:
+                self.logger.error(
+                    "[Depot CSV] Could not reload SKU rules from %s: %s (keeping %d previously loaded rule(s))",
+                    self.rules_path,
+                    e,
+                    len(self.rules),
+                )
+            else:
+                self.rules = {}
+                self.logger.error("[Depot CSV] Could not load SKU rules from %s: %s", self.rules_path, e)
 
     def ignore_existing_csvs(self, input_dir: Path) -> None:
         """Record existing CSVs so only new or changed files process after startup."""
@@ -1114,8 +1123,9 @@ class DepotCSVHandler(FileSystemEventHandler):
             return
         self._last_seen[key] = now
 
-        if not self.rules:
-            self._load_rules()
+        # Always refresh rules before processing so same-day workbook edits
+        # (new SKUs/vendors/printers) are picked up without restarting watcher.
+        self._load_rules()
         if not self.rules:
             self.logger.error("[Depot CSV] Rules are unavailable; skipping %s", path.name)
             return
