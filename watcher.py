@@ -1442,6 +1442,7 @@ class LabelHandler(FileSystemEventHandler):
         self.logger = logger
         self._last_seen: dict[str, float] = {}
         self._existing_label_signatures: dict[str, tuple[int, int, int]] = {}
+        self._processed_label_signatures: dict[str, tuple[int, int, int]] = {}
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
@@ -1496,11 +1497,18 @@ class LabelHandler(FileSystemEventHandler):
 
         key = str(path).lower()
         current_sig = _file_signature(path)
+        if current_sig is None:
+            return
+
         baseline_sig = self._existing_label_signatures.get(key)
         if baseline_sig is not None and current_sig == baseline_sig:
             return  # unchanged since startup — skip silently
         if baseline_sig is not None and current_sig != baseline_sig:
             self._existing_label_signatures.pop(key, None)
+
+        # Prevent duplicate re-appends for unchanged files after initial process.
+        if self._processed_label_signatures.get(key) == current_sig:
+            return
 
         now = time.monotonic()
         if now - self._last_seen.get(key, 0.0) < 10.0:
@@ -1547,6 +1555,7 @@ class LabelHandler(FileSystemEventHandler):
             output_bytes = pdf_bytes
 
         _stage_label_for_daily_rollup(retailer, vendor, output_dir, output_bytes, self.logger)
+        self._processed_label_signatures[key] = current_sig
 
     def poll_all_inputs(self) -> None:
         """Polling fallback for network shares where file-system events can be missed."""
