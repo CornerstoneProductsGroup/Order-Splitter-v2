@@ -999,12 +999,46 @@ class PDFHandler(FileSystemEventHandler):
         self.routes = routes
         self.logger    = logger
         self._last_seen: dict[str, float] = {}
+        self._existing_pdf_mtimes_ns: dict[str, int] = {}
+
+    def ignore_existing_pdfs(self, input_dir: Path) -> None:
+        """Record existing PDFs so only new/changed-after-start files process."""
+        pending = sorted(input_dir.glob("*.pdf"), key=lambda p: p.name.lower())
+        if not pending:
+            self.logger.info("[%s] No existing PDF files found at startup in %s", self.retailer, input_dir)
+            return
+
+        recorded = 0
+        for fp in pending:
+            try:
+                self._existing_pdf_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
+                recorded += 1
+            except OSError:
+                continue
+
+        self.logger.info(
+            "[%s] Ignoring %d existing PDF file(s) at startup; only new/changed files will process",
+            self.retailer,
+            recorded,
+        )
 
     def _process_if_pdf(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".pdf":
             return
 
         key = str(path).lower()
+        try:
+            current_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            current_mtime_ns = -1
+
+        baseline_mtime_ns = self._existing_pdf_mtimes_ns.get(key)
+        if baseline_mtime_ns is not None and current_mtime_ns == baseline_mtime_ns:
+            self.logger.info("[%s] Ignoring existing startup file unchanged since watcher start: %s", self.retailer, path.name)
+            return
+        if baseline_mtime_ns is not None and current_mtime_ns != baseline_mtime_ns:
+            self._existing_pdf_mtimes_ns.pop(key, None)
+
         now = time.monotonic()
         if now - self._last_seen.get(key, 0.0) < 10.0:
             return
@@ -1249,6 +1283,7 @@ def main() -> None:
     if PDF_WATCH_ENABLED:
         for retailer, watch_dir in WATCH_DIRS.items():
             handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], routes, logger)
+            handler.ignore_existing_pdfs(watch_dir)
             observer.schedule(handler, str(watch_dir), recursive=False)
             logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
             logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
