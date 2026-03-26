@@ -91,6 +91,14 @@ LABEL_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_LABEL_WATCH", "0").
 # Output size for a thermal 4×6 label (in PDF points at 72 pt/in).
 LABEL_OUTPUT_WIDTH_PT  = 4.0 * 72   # 288 pt
 LABEL_OUTPUT_HEIGHT_PT = 6.0 * 72   # 432 pt
+
+# Vendor folder names (case-insensitive) whose labels are printed on a full
+# 8.5×11 page and must NOT be resized.  They are still combined into the
+# daily rollup output file — just at their original page size.
+# Add the exact folder name as it appears under LABEL_WATCH_ROOT.
+LABEL_NO_RESIZE_VENDORS: set[str] = {
+    # "Vendor Name Here",
+}
 CSV_RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
 CSV_RULES_XLSX_PATH = Path(CSV_RULES_FILENAME)
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
@@ -845,25 +853,41 @@ def _stage_vendor_pdfs_for_daily_rollup(
 def _stage_label_for_daily_rollup(
     vendor: str,
     label_data: bytes,
-    filename: str,
     logger: logging.Logger,
 ) -> None:
-    """Write a resized label PDF to the daily rollup folder for the given vendor.
+    """Append label page(s) into a single combined PDF for the vendor in the daily rollup.
 
-    Layout:  {DAILY_VENDOR_ROLLUP_ROOT}/{VendorName}/{filename}
-    The label sits alongside the order PDFs in the vendor folder so both can be
-    selected when sending the daily vendor email.
+    Output:  {DAILY_VENDOR_ROLLUP_ROOT}/{VendorName}/{VendorName} - Labels.pdf
+    The first label dropped creates the file; every subsequent label's pages
+    are appended to it.  Source files in LABEL_WATCH_ROOT are never touched.
+    The combined file resets automatically each morning when the daily rollup clears.
     """
     _ensure_daily_rollup_current_day(logger)
     safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
     vendor_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
     try:
         vendor_dir.mkdir(parents=True, exist_ok=True)
-        dest = vendor_dir / filename
-        dest.write_bytes(label_data)
-        logger.info("[Labels] Resized label → %s", dest)
     except OSError as e:
-        logger.warning("[Labels] Could not write label for vendor '%s': %s", vendor, e)
+        logger.warning("[Labels] Could not create vendor dir for '%s': %s", vendor, e)
+        return
+
+    combined_path = vendor_dir / f"{safe_vendor} - Labels.pdf"
+    try:
+        if combined_path.exists():
+            existing_doc = fitz.open(str(combined_path))
+            new_doc = fitz.open(stream=label_data, filetype="pdf")
+            existing_doc.insert_pdf(new_doc)
+            new_doc.close()
+            buf = BytesIO()
+            existing_doc.save(buf)
+            existing_doc.close()
+            combined_path.write_bytes(buf.getvalue())
+            logger.info("[Labels] Appended label page(s) to combined file → %s", combined_path)
+        else:
+            combined_path.write_bytes(label_data)
+            logger.info("[Labels] Created combined label file → %s", combined_path)
+    except Exception as e:
+        logger.warning("[Labels] Could not write combined label for vendor '%s': %s", vendor, e)
 
 
 def _ensure_daily_rollup_current_day(logger: logging.Logger) -> None:
@@ -1379,7 +1403,12 @@ class LabelHandler(FileSystemEventHandler):
             return
 
         vendor = self._vendor_from_path(path)
-        self.logger.info("[Labels] Detected %s label for vendor '%s': %s", event_label, vendor, path.name)
+        no_resize = vendor.lower() in {v.lower() for v in LABEL_NO_RESIZE_VENDORS}
+        self.logger.info(
+            "[Labels] Detected %s label for vendor '%s': %s%s",
+            event_label, vendor, path.name,
+            " (no resize — 8×11 passthrough)" if no_resize else "",
+        )
 
         try:
             pdf_bytes = path.read_bytes()
@@ -1387,16 +1416,16 @@ class LabelHandler(FileSystemEventHandler):
             self.logger.error("[Labels] Cannot read %s: %s", path.name, e)
             return
 
-        try:
-            resized_bytes = resize_thermal_label_pdf(pdf_bytes)
-        except Exception as e:
-            self.logger.exception("[Labels] Error resizing %s: %s", path.name, e)
-            return
+        if no_resize:
+            output_bytes = pdf_bytes
+        else:
+            try:
+                output_bytes = resize_thermal_label_pdf(pdf_bytes)
+            except Exception as e:
+                self.logger.exception("[Labels] Error resizing %s: %s", path.name, e)
+                return
 
-        # Preserve the original filename so it's identifiable in the vendor folder.
-        stem = re.sub(r"\.pdf$", "", path.name, flags=re.IGNORECASE)
-        out_filename = f"{stem}_LABEL.pdf"
-        _stage_label_for_daily_rollup(vendor, resized_bytes, out_filename, self.logger)
+        _stage_label_for_daily_rollup(vendor, output_bytes, self.logger)
 
     def poll_label_root(self, watch_root: Path) -> None:
         """Polling fallback for network shares where file-system events can be missed."""
