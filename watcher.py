@@ -1084,24 +1084,38 @@ class DepotCSVHandler(FileSystemEventHandler):
                 self.logger.error("[Depot CSV] Could not load SKU rules from %s: %s", self.rules_path, e)
 
     def ignore_existing_csvs(self, input_dir: Path) -> None:
-        """Record existing CSVs so only new or changed files process after startup."""
+        """Record old existing CSVs so only current-day/new/changed files process after startup."""
         pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
         if not pending:
             self.logger.info("[Depot CSV] No existing CSV files found at startup in %s", input_dir)
             return
 
+        today = datetime.date.today()
         recorded = 0
+        will_process_now = 0
         for fp in pending:
             try:
-                self._existing_csv_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
+                st = fp.stat()
+                file_day = datetime.datetime.fromtimestamp(st.st_mtime).date()
+                if file_day == today:
+                    # Keep today's files eligible for immediate processing.
+                    will_process_now += 1
+                    continue
+
+                self._existing_csv_mtimes_ns[str(fp).lower()] = st.st_mtime_ns
                 recorded += 1
             except OSError:
                 continue
 
         self.logger.info(
-            "[Depot CSV] Ignoring %d existing CSV file(s) at startup; only new or changed files will process",
+            "[Depot CSV] Ignoring %d pre-existing older CSV file(s) at startup",
             recorded,
         )
+        if will_process_now:
+            self.logger.info(
+                "[Depot CSV] %d current-day CSV file(s) found at startup will still be processed",
+                will_process_now,
+            )
 
     def _process_if_csv(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".csv":
