@@ -110,6 +110,7 @@ PDF_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_PDF_WATCH", "0").stri
 @dataclass
 class LabelVendorRoute:
     """One row from the Label Vendor Routes workbook."""
+    retailer: str
     vendor: str
     input_path: Path
     output_path: Path
@@ -161,6 +162,7 @@ def load_label_vendor_routes(xlsx_path: Path, logger: logging.Logger) -> list[La
         resize = "8x11" not in size_raw  # anything other than 8x11 gets resized
         retailer = str(row.get("Retailer", "") or "").strip()
         routes.append(LabelVendorRoute(
+            retailer=retailer,
             vendor=vendor,
             input_path=Path(input_raw),
             output_path=Path(output_raw),
@@ -917,6 +919,7 @@ def _stage_vendor_pdfs_for_daily_rollup(
 
 
 def _stage_label_for_daily_rollup(
+    retailer: str,
     vendor: str,
     output_dir: Path,
     label_data: bytes,
@@ -935,7 +938,10 @@ def _stage_label_for_daily_rollup(
         logger.warning("[Labels] Could not create output dir for '%s': %s", vendor, e)
         return
 
-    combined_path = output_dir / f"{safe_vendor} - Labels.pdf"
+    safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
+    today = datetime.date.today().isoformat()
+    combined_name = f"{safe_vendor} {safe_retailer} {today}.pdf"
+    combined_path = output_dir / combined_name
     try:
         if combined_path.exists():
             existing_doc = fitz.open(str(combined_path))
@@ -1439,6 +1445,15 @@ class LabelHandler(FileSystemEventHandler):
         name = path.parent.name.strip()
         return name if name else "UNKNOWN"
 
+    def _retailer_from_input_path(self, input_dir: Path) -> str:
+        """Derive retailer name from input path segment like '2-Home Depot'."""
+        for part in input_dir.parts:
+            text = str(part).strip()
+            m = re.match(r"^\d+\s*-\s*(.+)$", text)
+            if m:
+                return m.group(1).strip() or "Retailer"
+        return "Retailer"
+
     def ignore_existing_labels(self) -> None:
         """Snapshot all existing label PDFs so only newly-added files process."""
         recorded = 0
@@ -1488,11 +1503,13 @@ class LabelHandler(FileSystemEventHandler):
 
         route = self._route_for_path(path)
         if route:
+            retailer = route.retailer.strip() or self._retailer_from_input_path(route.input_path)
             vendor = route.vendor
             output_dir = route.output_path
             resize = route.resize
         else:
             # Fallback: no matching config row — use folder name, rollup root, resize
+            retailer = self._retailer_from_input_path(path.parent)
             vendor = self._vendor_fallback(path)
             safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
             output_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
@@ -1519,7 +1536,7 @@ class LabelHandler(FileSystemEventHandler):
         else:
             output_bytes = pdf_bytes
 
-        _stage_label_for_daily_rollup(vendor, output_dir, output_bytes, self.logger)
+        _stage_label_for_daily_rollup(retailer, vendor, output_dir, output_bytes, self.logger)
 
     def poll_all_inputs(self) -> None:
         """Polling fallback for network shares where file-system events can be missed."""
