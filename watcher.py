@@ -81,6 +81,8 @@ CSV_ARCHIVE_DIR = Path(
 CSV_RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
 CSV_RULES_XLSX_PATH = Path(CSV_RULES_FILENAME)
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
+CSV_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_CSV_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
+PDF_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_PDF_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
 
 
 def _resolve_csv_rules_path(configured_path: Path) -> Path:
@@ -1255,29 +1257,41 @@ def main() -> None:
     crop_cfg = load_crop_config()
 
     observer = Observer()
-    for retailer, watch_dir in WATCH_DIRS.items():
-        handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], routes, logger)
-        observer.schedule(handler, str(watch_dir), recursive=False)
-        logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
-        logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
 
-    csv_handler = DepotCSVHandler(
-        rules_path=CSV_RULES_XLSX_PATH,
-        output_dir=CSV_OUTPUT_DIR,
-        archive_dir=CSV_ARCHIVE_DIR,
-        dry_run=CSV_DRY_RUN,
-        logger=logger,
-    )
-    logger.info("[Depot CSV] Input folder exists: %s", CSV_INPUT_DIR.exists())
-    logger.info("[Depot CSV] Output folder exists: %s", CSV_OUTPUT_DIR.exists())
-    logger.info("[Depot CSV] Archive folder exists: %s", CSV_ARCHIVE_DIR.exists())
-    csv_handler.ignore_existing_csvs(CSV_INPUT_DIR)
-    observer.schedule(csv_handler, str(CSV_INPUT_DIR), recursive=False)
-    logger.info("Watching [Depot CSV      ] → %s/", CSV_INPUT_DIR)
-    logger.info("CSV output              → %s/", CSV_OUTPUT_DIR)
-    logger.info("CSV archive             → %s/", CSV_ARCHIVE_DIR)
-    logger.info("CSV rules file          → %s", csv_handler.rules_path)
-    logger.info("CSV dry-run mode        → %s", CSV_DRY_RUN)
+    if not PDF_WATCH_ENABLED and not CSV_WATCH_ENABLED:
+        logger.error("Both PDF and CSV watchers are disabled by environment settings.")
+        return
+
+    if PDF_WATCH_ENABLED:
+        for retailer, watch_dir in WATCH_DIRS.items():
+            handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], routes, logger)
+            observer.schedule(handler, str(watch_dir), recursive=False)
+            logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
+            logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
+    else:
+        logger.info("PDF watcher disabled by ORDER_SPLITTER_DISABLE_PDF_WATCH")
+
+    csv_handler: DepotCSVHandler | None = None
+    if CSV_WATCH_ENABLED:
+        csv_handler = DepotCSVHandler(
+            rules_path=CSV_RULES_XLSX_PATH,
+            output_dir=CSV_OUTPUT_DIR,
+            archive_dir=CSV_ARCHIVE_DIR,
+            dry_run=CSV_DRY_RUN,
+            logger=logger,
+        )
+        logger.info("[Depot CSV] Input folder exists: %s", CSV_INPUT_DIR.exists())
+        logger.info("[Depot CSV] Output folder exists: %s", CSV_OUTPUT_DIR.exists())
+        logger.info("[Depot CSV] Archive folder exists: %s", CSV_ARCHIVE_DIR.exists())
+        csv_handler.ignore_existing_csvs(CSV_INPUT_DIR)
+        observer.schedule(csv_handler, str(CSV_INPUT_DIR), recursive=False)
+        logger.info("Watching [Depot CSV      ] → %s/", CSV_INPUT_DIR)
+        logger.info("CSV output              → %s/", CSV_OUTPUT_DIR)
+        logger.info("CSV archive             → %s/", CSV_ARCHIVE_DIR)
+        logger.info("CSV rules file          → %s", csv_handler.rules_path)
+        logger.info("CSV dry-run mode        → %s", CSV_DRY_RUN)
+    else:
+        logger.info("CSV watcher disabled by ORDER_SPLITTER_DISABLE_CSV_WATCH")
 
     logger.info("Daily rollup output     → %s/", DAILY_VENDOR_ROLLUP_ROOT)
 
@@ -1286,7 +1300,8 @@ def main() -> None:
     observer.start()
     try:
         while True:
-            csv_handler.poll_input_dir(CSV_INPUT_DIR)
+            if csv_handler is not None:
+                csv_handler.poll_input_dir(CSV_INPUT_DIR)
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
