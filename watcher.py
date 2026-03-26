@@ -1087,41 +1087,25 @@ class DepotCSVHandler(FileSystemEventHandler):
                 self.logger.error("[Depot CSV] Could not load SKU rules from %s: %s", self.rules_path, e)
 
     def ignore_existing_csvs(self, input_dir: Path) -> None:
-        """Record old existing CSVs so only current-day/new/changed files process after startup."""
+        """Record existing CSVs so only new/changed-after-start files process."""
         pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
         if not pending:
             self.logger.info("[Depot CSV] No existing CSV files found at startup in %s", input_dir)
             return
 
-        today = datetime.date.today()
         recorded = 0
-        will_process_now = 0
         for fp in pending:
             try:
                 st = fp.stat()
-                # Some download workflows preserve original mtime from source;
-                # include ctime so newly dropped files aren't treated as historical.
-                recent_ts = max(st.st_mtime, st.st_ctime)
-                file_day = datetime.datetime.fromtimestamp(recent_ts).date()
-                if file_day == today:
-                    # Keep today's files eligible for immediate processing.
-                    will_process_now += 1
-                    continue
-
                 self._existing_csv_mtimes_ns[str(fp).lower()] = st.st_mtime_ns
                 recorded += 1
             except OSError:
                 continue
 
         self.logger.info(
-            "[Depot CSV] Ignoring %d pre-existing older CSV file(s) at startup",
+            "[Depot CSV] Ignoring %d existing CSV file(s) at startup; only new/changed files will process",
             recorded,
         )
-        if will_process_now:
-            self.logger.info(
-                "[Depot CSV] %d current-day CSV file(s) found at startup will still be processed",
-                will_process_now,
-            )
 
     def _process_if_csv(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".csv":

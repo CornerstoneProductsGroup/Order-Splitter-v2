@@ -6,7 +6,8 @@ reliably on its own schedule/task without PDF watcher complexity.
 
 Behavior:
 - Polls Depot CSV input folder every few seconds.
-- Processes only files that are new or changed since last successful run.
+- Baselines files already present at startup (does not process backlog).
+- Processes only files that are new or changed after startup.
 - Keeps raw input files in place (archive is copy-only via process module).
 - Reloads rules workbook before each file (with last-good fallback if locked).
 
@@ -155,6 +156,29 @@ def main() -> None:
 
     state = _load_state(state_file)
     state_files = state.setdefault("files", {})
+
+    # Baseline any CSVs already in the folder at startup so we do not process
+    # historical backlog when the watcher starts/restarts.
+    startup_pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
+    startup_baselined = 0
+    for csv_path in startup_pending:
+        try:
+            mtime_ns, size = _fingerprint(csv_path)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            logger.error("Could not stat %s at startup baseline: %s", csv_path.name, e)
+            continue
+
+        state_files[str(csv_path).lower()] = {
+            "mtime_ns": mtime_ns,
+            "size": size,
+            "last_processed": "startup-baseline",
+        }
+        startup_baselined += 1
+
+    _save_state(state_file, state)
+    logger.info("Startup baseline recorded for %d existing CSV file(s)", startup_baselined)
 
     rules: dict[str, depot_csv.SkuRule] = {}
     next_heartbeat = 0.0
