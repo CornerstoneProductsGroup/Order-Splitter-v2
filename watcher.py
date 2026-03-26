@@ -37,6 +37,8 @@ from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 
+from dataclasses import dataclass
+
 import fitz  # PyMuPDF
 import pandas as pd
 import process_depot_csv_orders as depot_csv
@@ -92,18 +94,75 @@ LABEL_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_LABEL_WATCH", "0").
 LABEL_OUTPUT_WIDTH_PT  = 4.0 * 72   # 288 pt
 LABEL_OUTPUT_HEIGHT_PT = 6.0 * 72   # 432 pt
 
-# Vendor folder names (case-insensitive) whose labels are printed on a full
-# 8.5×11 page and must NOT be resized.  They are still combined into the
-# daily rollup output file — just at their original page size.
-# Add the exact folder name as it appears under LABEL_WATCH_ROOT.
-LABEL_NO_RESIZE_VENDORS: set[str] = {
-    # "Vendor Name Here",
-}
+# Spreadsheet that configures per-vendor label input/output paths and label size.
+# Expected columns: Vendor | InputPath | OutputPath | LabelSize
+# LabelSize values: "4x6"  → crop to thermal 4×6
+#                   "8x11" → pass through at original size (no resize)
+LABEL_ROUTES_XLSX_PATH = Path("Label Vendor Routes.xlsx")
 CSV_RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
 CSV_RULES_XLSX_PATH = Path(CSV_RULES_FILENAME)
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
 CSV_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_CSV_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
 PDF_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_PDF_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
+
+
+@dataclass
+class LabelVendorRoute:
+    """One row from the Label Vendor Routes workbook."""
+    vendor: str
+    input_path: Path
+    output_path: Path
+    resize: bool  # True = crop to 4×6; False = pass through at original size
+
+
+def load_label_vendor_routes(xlsx_path: Path, logger: logging.Logger) -> list[LabelVendorRoute]:
+    """Load per-vendor label routing config from the xlsx spreadsheet.
+
+    Required columns: Vendor, InputPath, OutputPath, LabelSize
+    LabelSize: "4x6" → resize to thermal; "8x11" → no resize.
+    Returns an empty list if the file is missing or cannot be parsed.
+    """
+    if not xlsx_path.exists():
+        # Resolve relative to script directory as well.
+        alt = Path(__file__).resolve().parent / xlsx_path
+        if alt.exists():
+            xlsx_path = alt
+        else:
+            logger.warning("[Labels] Routes workbook not found: %s — falling back to folder-name detection", xlsx_path)
+            return []
+
+    try:
+        df = pd.read_excel(xlsx_path)
+    except Exception as e:
+        logger.error("[Labels] Could not read routes workbook %s: %s", xlsx_path, e)
+        return []
+
+    required = {"Vendor", "InputPath", "OutputPath", "LabelSize"}
+    missing = required - set(df.columns)
+    if missing:
+        logger.error("[Labels] Routes workbook missing columns: %s", missing)
+        return []
+
+    routes: list[LabelVendorRoute] = []
+    for _, row in df.iterrows():
+        vendor = str(row.get("Vendor", "") or "").strip()
+        input_raw = str(row.get("InputPath", "") or "").strip()
+        output_raw = str(row.get("OutputPath", "") or "").strip()
+        size_raw = str(row.get("LabelSize", "") or "").strip().lower()
+
+        if not vendor or not input_raw or not output_raw or not size_raw:
+            continue
+
+        resize = "8x11" not in size_raw  # anything other than 8x11 gets resized
+        routes.append(LabelVendorRoute(
+            vendor=vendor,
+            input_path=Path(input_raw),
+            output_path=Path(output_raw),
+            resize=resize,
+        ))
+
+    logger.info("[Labels] Loaded %d vendor route(s) from %s", len(routes), xlsx_path)
+    return routes
 
 
 def _resolve_csv_rules_path(configured_path: Path) -> Path:
@@ -852,26 +911,24 @@ def _stage_vendor_pdfs_for_daily_rollup(
 
 def _stage_label_for_daily_rollup(
     vendor: str,
+    output_dir: Path,
     label_data: bytes,
     logger: logging.Logger,
 ) -> None:
-    """Append label page(s) into a single combined PDF for the vendor in the daily rollup.
+    """Append label page(s) into a single combined PDF for the vendor.
 
-    Output:  {DAILY_VENDOR_ROLLUP_ROOT}/{VendorName}/{VendorName} - Labels.pdf
+    Output file: {output_dir}/{safe_vendor} - Labels.pdf
     The first label dropped creates the file; every subsequent label's pages
     are appended to it.  Source files in LABEL_WATCH_ROOT are never touched.
-    The combined file resets automatically each morning when the daily rollup clears.
     """
-    _ensure_daily_rollup_current_day(logger)
     safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
-    vendor_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
     try:
-        vendor_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        logger.warning("[Labels] Could not create vendor dir for '%s': %s", vendor, e)
+        logger.warning("[Labels] Could not create output dir for '%s': %s", vendor, e)
         return
 
-    combined_path = vendor_dir / f"{safe_vendor} - Labels.pdf"
+    combined_path = output_dir / f"{safe_vendor} - Labels.pdf"
     try:
         if combined_path.exists():
             existing_doc = fitz.open(str(combined_path))
@@ -1339,43 +1396,63 @@ class DepotCSVHandler(FileSystemEventHandler):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LabelHandler(FileSystemEventHandler):
-    """Watch vendor subfolders under LABEL_WATCH_ROOT for WorldShip label PDFs.
+    """Watch configured vendor label input folders for WorldShip label PDFs.
 
-    Drop a label PDF into  LABEL_WATCH_ROOT/{VendorName}/label.pdf  and it
-    will be auto-cropped from 8.5×11 down to a proper 4×6 page, then written
-    alongside the order PDFs in  DAILY_VENDOR_ROLLUP_ROOT/{VendorName}/.
+    Behaviour is driven by a list of LabelVendorRoute entries loaded from
+    'Label Vendor Routes.xlsx'.  Each entry defines:
+      - input_path  : folder to watch for incoming label PDFs
+      - output_path : folder where the combined {Vendor} - Labels.pdf is written
+      - resize      : True → crop 8.5×11 page down to 4×6 thermal size
+                      False → pass through at original page size
+
+    When no routes config is found, falls back to watching LABEL_WATCH_ROOT
+    recursively and deriving the vendor name from the subfolder name.
     """
 
-    def __init__(self, logger: logging.Logger) -> None:
+    def __init__(self, routes: list[LabelVendorRoute], logger: logging.Logger) -> None:
         super().__init__()
+        self.routes = routes
         self.logger = logger
         self._last_seen: dict[str, float] = {}
         self._existing_label_mtimes_ns: dict[str, int] = {}
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
+        # Build fast lookup: normalised input_path string → route
+        self._route_by_input: dict[str, LabelVendorRoute] = {
+            str(r.input_path).lower(): r for r in routes
+        }
 
-    def ignore_existing_labels(self, watch_root: Path) -> None:
+    def _route_for_path(self, path: Path) -> LabelVendorRoute | None:
+        """Return the route whose input_path matches the file's parent directory."""
+        return self._route_by_input.get(str(path.parent).lower())
+
+    def _vendor_fallback(self, path: Path) -> str:
+        """Derive vendor name from the immediate parent folder (fallback only)."""
+        name = path.parent.name.strip()
+        return name if name else "UNKNOWN"
+
+    def ignore_existing_labels(self) -> None:
         """Snapshot all existing label PDFs so only newly-added files process."""
-        try:
-            pending = list(watch_root.rglob("*.pdf"))
-        except Exception:
-            return
         recorded = 0
-        for fp in pending:
+        if self.routes:
+            paths_to_scan = [r.input_path for r in self.routes]
+        else:
+            paths_to_scan = [LABEL_WATCH_ROOT]
+
+        for scan_root in paths_to_scan:
             try:
-                self._existing_label_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
-                recorded += 1
-            except OSError:
+                for fp in scan_root.rglob("*.pdf"):
+                    try:
+                        self._existing_label_mtimes_ns[str(fp).lower()] = fp.stat().st_mtime_ns
+                        recorded += 1
+                    except OSError:
+                        continue
+            except Exception:
                 continue
+
         if recorded:
             self.logger.info("[Labels] Ignoring %d existing label PDF(s) at startup", recorded)
-
-    def _vendor_from_path(self, path: Path) -> str:
-        """Return the vendor name from the file's immediate parent folder."""
-        # Expected layout: LABEL_WATCH_ROOT/{VendorName}/{file.pdf}
-        vendor = path.parent.name.strip()
-        return vendor if vendor else "UNKNOWN"
 
     def _process_if_label(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".pdf":
@@ -1402,12 +1479,22 @@ class LabelHandler(FileSystemEventHandler):
             self.logger.error("[Labels] Timed out waiting for %s to finish writing — skipping.", path.name)
             return
 
-        vendor = self._vendor_from_path(path)
-        no_resize = vendor.lower() in {v.lower() for v in LABEL_NO_RESIZE_VENDORS}
+        route = self._route_for_path(path)
+        if route:
+            vendor = route.vendor
+            output_dir = route.output_path
+            resize = route.resize
+        else:
+            # Fallback: no matching config row — use folder name, rollup root, resize
+            vendor = self._vendor_fallback(path)
+            safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+            output_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
+            resize = True
+
         self.logger.info(
             "[Labels] Detected %s label for vendor '%s': %s%s",
             event_label, vendor, path.name,
-            " (no resize — 8×11 passthrough)" if no_resize else "",
+            " (8×11 passthrough — no resize)" if not resize else " (resizing to 4×6)",
         )
 
         try:
@@ -1416,37 +1503,41 @@ class LabelHandler(FileSystemEventHandler):
             self.logger.error("[Labels] Cannot read %s: %s", path.name, e)
             return
 
-        if no_resize:
-            output_bytes = pdf_bytes
-        else:
+        if resize:
             try:
                 output_bytes = resize_thermal_label_pdf(pdf_bytes)
             except Exception as e:
                 self.logger.exception("[Labels] Error resizing %s: %s", path.name, e)
                 return
+        else:
+            output_bytes = pdf_bytes
 
-        _stage_label_for_daily_rollup(vendor, output_bytes, self.logger)
+        _stage_label_for_daily_rollup(vendor, output_dir, output_bytes, self.logger)
 
-    def poll_label_root(self, watch_root: Path) -> None:
+    def poll_all_inputs(self) -> None:
         """Polling fallback for network shares where file-system events can be missed."""
         now = time.monotonic()
         if now < self._next_poll_at:
             return
         self._next_poll_at = now + self._poll_interval_sec
 
-        try:
-            pending = list(watch_root.rglob("*.pdf"))
-        except Exception as e:
-            self.logger.error("[Labels] Poll failed for %s: %s", watch_root, e)
-            return
+        if self.routes:
+            pending: list[Path] = []
+            for r in self.routes:
+                try:
+                    pending.extend(r.input_path.glob("*.pdf"))
+                except Exception as e:
+                    self.logger.error("[Labels] Poll failed for %s: %s", r.input_path, e)
+        else:
+            try:
+                pending = list(LABEL_WATCH_ROOT.rglob("*.pdf"))
+            except Exception as e:
+                self.logger.error("[Labels] Poll failed for %s: %s", LABEL_WATCH_ROOT, e)
+                return
 
         if now >= self._next_poll_log_at:
             self._next_poll_log_at = now + 60.0
-            self.logger.info(
-                "[Labels] Poll heartbeat: %d label PDF(s) visible under %s",
-                len(pending),
-                watch_root,
-            )
+            self.logger.info("[Labels] Poll heartbeat: %d label PDF(s) across all vendor input folders", len(pending))
 
         for fp in pending:
             self._process_if_label(fp, "polled")
@@ -1546,12 +1637,30 @@ def main() -> None:
 
     label_handler: LabelHandler | None = None
     if PDF_WATCH_ENABLED and LABEL_WATCH_ENABLED:
-        label_handler = LabelHandler(logger)
-        label_handler.ignore_existing_labels(LABEL_WATCH_ROOT)
-        observer.schedule(label_handler, str(LABEL_WATCH_ROOT), recursive=True)
-        logger.info("Watching [Labels        ] → %s/ (recursive)", LABEL_WATCH_ROOT)
-        logger.info("Label output            → %s/{VendorName}/", DAILY_VENDOR_ROLLUP_ROOT)
-        logger.info("Label output size       → 4×6 inches (%.0f×%.0f pt)", LABEL_OUTPUT_WIDTH_PT, LABEL_OUTPUT_HEIGHT_PT)
+        label_routes = load_label_vendor_routes(LABEL_ROUTES_XLSX_PATH, logger)
+        label_handler = LabelHandler(label_routes, logger)
+        label_handler.ignore_existing_labels()
+        if label_routes:
+            # Watch each configured input path individually.
+            watched_label_dirs: set[str] = set()
+            for route in label_routes:
+                route.input_path.mkdir(parents=True, exist_ok=True)
+                route.output_path.mkdir(parents=True, exist_ok=True)
+                dir_key = str(route.input_path)
+                if dir_key not in watched_label_dirs:
+                    observer.schedule(label_handler, dir_key, recursive=False)
+                    watched_label_dirs.add(dir_key)
+                logger.info(
+                    "Watching [Labels %-8s] → %s  (%s)",
+                    route.vendor[:8], route.input_path,
+                    "4×6 resize" if route.resize else "8×11 passthrough",
+                )
+                logger.info("  Label output          → %s", route.output_path)
+        else:
+            # No config found — fall back to recursive watch on LABEL_WATCH_ROOT.
+            LABEL_WATCH_ROOT.mkdir(parents=True, exist_ok=True)
+            observer.schedule(label_handler, str(LABEL_WATCH_ROOT), recursive=True)
+            logger.info("Watching [Labels        ] → %s/ (recursive, no routes config)", LABEL_WATCH_ROOT)
     elif not PDF_WATCH_ENABLED:
         logger.info("Label watcher skipped (requires PDF watcher to be enabled)")
     else:
@@ -1567,7 +1676,7 @@ def main() -> None:
             if csv_handler is not None:
                 csv_handler.poll_input_dir(CSV_INPUT_DIR)
             if label_handler is not None:
-                label_handler.poll_label_root(LABEL_WATCH_ROOT)
+                label_handler.poll_all_inputs()
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
