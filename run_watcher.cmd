@@ -9,14 +9,20 @@ echo ================================================== >> "%LOG%"
 echo [%date% %time%] Starting watcher launcher >> "%LOG%"
 echo [%date% %time%] Working dir: %cd% >> "%LOG%"
 
-set "PY="
-if exist "%~dp0.venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
-if not defined PY if exist "%~dp0venv\Scripts\python.exe" set "PY=%~dp0venv\Scripts\python.exe"
-if not defined PY set "PY=C:\Windows\py.exe"
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" (
+	set "PY=%~dp0venv\Scripts\python.exe"
+)
+
+if not exist "%PY%" (
+	echo [%date% %time%] ERROR: No project venv python found. Expected .venv\Scripts\python.exe or venv\Scripts\python.exe >> "%LOG%"
+	echo [%date% %time%] ERROR: Create venv and install requirements before running scheduled task. >> "%LOG%"
+	exit /b 2
+)
 
 echo [%date% %time%] Python: %PY% >> "%LOG%"
 
-"%PY%" -3 watcher.py >> "%LOG%" 2>&1
+"%PY%" watcher.py >> "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 echo [%date% %time%] watcher.py exited with code %EC% >> "%LOG%"
 exit /b %EC%
