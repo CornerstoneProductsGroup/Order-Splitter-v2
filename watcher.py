@@ -25,6 +25,7 @@ Stop:
 """
 
 import io
+import hashlib
 import json
 import logging
 import os
@@ -928,7 +929,7 @@ def _stage_label_for_daily_rollup(
     output_dir: Path,
     label_data: bytes,
     logger: logging.Logger,
-) -> None:
+) -> bool:
     """Append label page(s) into a single combined PDF for the vendor.
 
     Output file: {output_dir}/{safe_vendor} - Labels.pdf
@@ -940,7 +941,7 @@ def _stage_label_for_daily_rollup(
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         logger.warning("[Labels] Could not create output dir for '%s': %s", vendor, e)
-        return
+        return False
 
     safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
     today = datetime.date.today().isoformat()
@@ -948,20 +949,34 @@ def _stage_label_for_daily_rollup(
     combined_path = output_dir / combined_name
     try:
         if combined_path.exists():
-            existing_doc = fitz.open(str(combined_path))
-            new_doc = fitz.open(stream=label_data, filetype="pdf")
-            existing_doc.insert_pdf(new_doc)
-            new_doc.close()
-            buf = BytesIO()
-            existing_doc.save(buf)
-            existing_doc.close()
-            combined_path.write_bytes(buf.getvalue())
+            existing_doc = None
+            new_doc = None
+            try:
+                # Open from file path and save incrementally to avoid full rewrites
+                # on every append, which can become very slow and hold file locks.
+                existing_doc = fitz.open(str(combined_path))
+                new_doc = fitz.open(stream=label_data, filetype="pdf")
+                existing_doc.insert_pdf(new_doc)
+                try:
+                    existing_doc.saveIncr()
+                except Exception:
+                    # Fallback when incremental save is unavailable.
+                    buf = BytesIO()
+                    existing_doc.save(buf)
+                    combined_path.write_bytes(buf.getvalue())
+            finally:
+                if new_doc is not None:
+                    new_doc.close()
+                if existing_doc is not None:
+                    existing_doc.close()
             logger.info("[Labels] Appended label page(s) to combined file → %s", combined_path)
         else:
             combined_path.write_bytes(label_data)
             logger.info("[Labels] Created combined label file → %s", combined_path)
+        return True
     except Exception as e:
         logger.warning("[Labels] Could not write combined label for vendor '%s': %s", vendor, e)
+        return False
 
 
 def _ensure_daily_rollup_current_day(logger: logging.Logger) -> None:
@@ -1456,6 +1471,7 @@ class LabelHandler(FileSystemEventHandler):
         self._last_seen: dict[str, float] = {}
         self._existing_label_signatures: dict[str, tuple[int, int, int]] = {}
         self._processed_label_signatures: dict[str, tuple[int, int]] = {}
+        self._processed_label_hashes_by_output: dict[str, set[str]] = {}
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
@@ -1571,8 +1587,23 @@ class LabelHandler(FileSystemEventHandler):
         else:
             output_bytes = pdf_bytes
 
-        _stage_label_for_daily_rollup(retailer, vendor, output_dir, output_bytes, self.logger)
-        self._processed_label_signatures[key] = current_stable_sig
+        safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+        safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
+        today = datetime.date.today().isoformat()
+        combined_name = f"{safe_retailer} {safe_vendor} {today} LABEL.pdf"
+        output_key = str(output_dir / combined_name).lower()
+
+        content_hash = hashlib.sha1(output_bytes).hexdigest()
+        seen_hashes = self._processed_label_hashes_by_output.setdefault(output_key, set())
+        if content_hash in seen_hashes:
+            self.logger.info("[Labels] Duplicate label content skipped for vendor '%s': %s", vendor, path.name)
+            self._processed_label_signatures[key] = current_stable_sig
+            return
+
+        staged_ok = _stage_label_for_daily_rollup(retailer, vendor, output_dir, output_bytes, self.logger)
+        if staged_ok:
+            seen_hashes.add(content_hash)
+            self._processed_label_signatures[key] = current_stable_sig
 
     def poll_all_inputs(self) -> None:
         """Polling fallback for network shares where file-system events can be missed."""
