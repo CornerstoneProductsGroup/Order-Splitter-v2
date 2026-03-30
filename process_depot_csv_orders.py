@@ -224,7 +224,11 @@ def load_sku_rules(path: Path) -> dict[str, SkuRule]:
         printer = _norm_text(row.get(col_printer))  # type: ignore[arg-type]
 
         vendor_name = _norm_text(row.get(col_vendor)) if col_vendor else ""
-        po_description = _norm_text(row.get(col_po_desc)) if col_po_desc else ""
+        if col_po_desc:
+            po_desc_raw = row.get(col_po_desc)  # type: ignore[arg-type]
+            po_description = "" if pd.isna(po_desc_raw) else _norm_text(po_desc_raw)
+        else:
+            po_description = ""
         vendor_sort_order = _parse_int(row.get(col_vendor_order), 9999) if col_vendor_order else 9999
 
         label_action = _norm_text(row.get(col_action)).lower() if col_action else ""
