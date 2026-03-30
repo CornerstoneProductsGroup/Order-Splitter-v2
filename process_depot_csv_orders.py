@@ -96,6 +96,7 @@ IDX_AE = 30
 
 IDX_OUTPUT_L = 11
 IDX_OUTPUT_P = 15
+IDX_PURCHASE_ORDER = 14
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class SkuRule:
     vendor_sort_order: int
     label_action: str
     label_action_order: int
+    po_description: str
 
 
 def _norm_text(value: object) -> str:
@@ -193,6 +195,16 @@ def load_sku_rules(path: Path) -> dict[str, SkuRule]:
     col_printer = _find_col(df, ["Printer", "LABEL_PRINTER_ID"], required=True)
 
     col_vendor = _find_col(df, ["VendorName", "Vendor", "Vendor Name"])
+    col_po_desc = _find_col(
+        df,
+        [
+            "Added Description with PO#",
+            "PO Description",
+            "PO Descriptor",
+            "Reference Description",
+            "PKG_CUSTOM4 Description",
+        ],
+    )
     col_vendor_order = _find_col(df, ["VendorSortOrder", "VendorOrder", "Vendor Sort", "Vendor Priority"])
     col_action = _find_col(df, ["LabelAction", "Action", "SaveOrPrint", "Label Mode"])
     col_action_order = _find_col(df, ["LabelActionOrder", "ActionOrder", "Action Priority"])
@@ -212,6 +224,7 @@ def load_sku_rules(path: Path) -> dict[str, SkuRule]:
         printer = _norm_text(row.get(col_printer))  # type: ignore[arg-type]
 
         vendor_name = _norm_text(row.get(col_vendor)) if col_vendor else ""
+        po_description = _norm_text(row.get(col_po_desc)) if col_po_desc else ""
         vendor_sort_order = _parse_int(row.get(col_vendor_order), 9999) if col_vendor_order else 9999
 
         label_action = _norm_text(row.get(col_action)).lower() if col_action else ""
@@ -235,6 +248,7 @@ def load_sku_rules(path: Path) -> dict[str, SkuRule]:
             vendor_sort_order=vendor_sort_order,
             label_action=label_action,
             label_action_order=label_action_order,
+            po_description=po_description,
         )
 
     if not rules:
@@ -327,6 +341,9 @@ def process_file(raw_csv: Path, rules: dict[str, SkuRule], output_dir: Path) -> 
 
         if rule is not None:
             base[IDX_X] = rule.printer
+            if rule.po_description:
+                po_value = _norm_text(base[IDX_PURCHASE_ORDER])
+                base[IDX_PURCHASE_ORDER] = f"{po_value} {rule.po_description}".strip()
         else:
             unknown_skus += 1
             continue
