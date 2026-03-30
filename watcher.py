@@ -927,13 +927,16 @@ def _stage_vendor_pdfs_for_daily_rollup(
 def _save_individual_label_backup(
     output_dir: Path,
     source_stem: str,
+    source_digest: str,
     label_data: bytes,
     logger: logging.Logger,
 ) -> None:
-    """Write one resized label as its own timestamped PDF in an 'Individual Labels'
-    subfolder under *output_dir*.  These files are never appended to — they are
-    plain single-label PDFs that can be merged manually if the combined file
-    ever has problems.
+    """Write one resized label as a deterministic single-label PDF in an
+    'Individual Labels' subfolder under *output_dir*.
+
+    The filename is based on source file stem + content digest so repeated
+    processing attempts for the same source overwrite/no-op instead of
+    creating timestamped duplicates.
     """
     backup_dir = output_dir / "Individual Labels"
     try:
@@ -942,11 +945,19 @@ def _save_individual_label_backup(
         logger.warning("[Labels] Could not create individual label backup dir: %s", e)
         return
 
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]  # up to seconds
-    filename = f"{source_stem}_{stamp}.pdf"
+    digest_tag = (source_digest or "")[:12] or "unknown"
+    filename = f"{source_stem}_{digest_tag}.pdf"
+    target_path = backup_dir / filename
     try:
-        (backup_dir / filename).write_bytes(label_data)
-        logger.info("[Labels] Saved individual label → %s", backup_dir / filename)
+        if target_path.exists():
+            try:
+                if target_path.read_bytes() == label_data:
+                    logger.info("[Labels] Individual label already saved → %s", target_path)
+                    return
+            except OSError:
+                pass
+        target_path.write_bytes(label_data)
+        logger.info("[Labels] Saved individual label → %s", target_path)
     except OSError as e:
         logger.warning("[Labels] Could not save individual label '%s': %s", filename, e)
 
@@ -1500,8 +1511,11 @@ class LabelHandler(FileSystemEventHandler):
         self._existing_label_signatures: dict[str, tuple[int, int, int]] = {}
         self._processed_label_signatures: dict[str, tuple[int, int]] = {}
         self._processed_label_hashes_by_output: dict[str, set[str]] = {}
+        self._processed_source_digests_by_output: dict[str, set[str]] = {}
         self._in_progress: set[str] = set()  # keys currently being processed
         self._lock = threading.Lock()  # guards all shared state
+        self._dedupe_day = datetime.date.today().isoformat()
+        self._dedupe_state_path = OUTPUT_ROOT / ".label_dedupe_state.json"
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
@@ -1509,6 +1523,67 @@ class LabelHandler(FileSystemEventHandler):
         self._route_by_input: dict[str, LabelVendorRoute] = {
             str(r.input_path).lower(): r for r in routes
         }
+        self._load_label_dedupe_state()
+
+    def _load_label_dedupe_state(self) -> None:
+        """Load current-day source-digest dedupe state from disk, if present."""
+        try:
+            if not self._dedupe_state_path.exists():
+                return
+            raw = json.loads(self._dedupe_state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            day = str(raw.get("day", "") or "")
+            today = datetime.date.today().isoformat()
+            if day != today:
+                return
+            by_output_raw = raw.get("processed_source_digests_by_output", {})
+            if not isinstance(by_output_raw, dict):
+                return
+            restored: dict[str, set[str]] = {}
+            loaded = 0
+            for out_key, digests in by_output_raw.items():
+                if not isinstance(out_key, str) or not isinstance(digests, list):
+                    continue
+                normalized = {str(x) for x in digests if isinstance(x, str) and x}
+                if normalized:
+                    restored[out_key] = normalized
+                    loaded += len(normalized)
+            self._processed_source_digests_by_output = restored
+            self._dedupe_day = today
+            if loaded:
+                self.logger.info("[Labels] Restored %d processed label digest(s) from %s", loaded, self._dedupe_state_path)
+        except Exception as e:
+            self.logger.warning("[Labels] Could not load dedupe state from %s: %s", self._dedupe_state_path, e)
+
+    def _persist_label_dedupe_state(self) -> None:
+        """Persist current-day source-digest dedupe state atomically to disk."""
+        with self._lock:
+            payload = {
+                "day": self._dedupe_day,
+                "processed_source_digests_by_output": {
+                    k: sorted(v) for k, v in self._processed_source_digests_by_output.items() if v
+                },
+            }
+
+        try:
+            self._dedupe_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._dedupe_state_path.with_suffix(self._dedupe_state_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(self._dedupe_state_path)
+        except Exception as e:
+            self.logger.warning("[Labels] Could not persist dedupe state to %s: %s", self._dedupe_state_path, e)
+
+    def _rollover_dedupe_day_if_needed(self) -> None:
+        """Reset in-memory dedupe maps when day changes."""
+        today = datetime.date.today().isoformat()
+        if today == self._dedupe_day:
+            return
+        with self._lock:
+            if today != self._dedupe_day:
+                self._dedupe_day = today
+                self._processed_source_digests_by_output.clear()
+                self._processed_label_hashes_by_output.clear()
 
     def _route_for_path(self, path: Path) -> LabelVendorRoute | None:
         """Return the route whose input_path matches the file's parent directory."""
@@ -1597,6 +1672,8 @@ class LabelHandler(FileSystemEventHandler):
                 self.logger.error("[Labels] Timed out waiting for %s to finish writing — skipping.", path.name)
                 return
 
+            self._rollover_dedupe_day_if_needed()
+
             route = self._route_for_path(path)
             if route:
                 retailer = route.retailer.strip() or self._retailer_from_input_path(route.input_path)
@@ -1617,11 +1694,25 @@ class LabelHandler(FileSystemEventHandler):
                 " (8×11 passthrough — no resize)" if not resize else " (resizing to 4×6)",
             )
 
+            safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+            safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
+            today = datetime.date.today().isoformat()
+            combined_name = f"{safe_retailer} {safe_vendor} {today} LABEL.pdf"
+            output_key = str(output_dir / combined_name).lower()
+
             try:
                 pdf_bytes = path.read_bytes()
             except OSError as e:
                 self.logger.error("[Labels] Cannot read %s: %s", path.name, e)
                 return
+
+            source_digest = hashlib.sha1(pdf_bytes).hexdigest()
+            with self._lock:
+                seen_sources = self._processed_source_digests_by_output.setdefault(output_key, set())
+                if source_digest in seen_sources:
+                    self.logger.info("[Labels] Duplicate source skipped for vendor '%s': %s", vendor, path.name)
+                    self._processed_label_signatures[key] = current_stable_sig
+                    return
 
             if resize:
                 try:
@@ -1635,13 +1726,7 @@ class LabelHandler(FileSystemEventHandler):
             # Save a resized individual-label backup before attempting the merge.
             # This gives a clean per-label file to manually combine if the merged
             # file ever has duplicate or corruption issues.
-            _save_individual_label_backup(output_dir, path.stem, output_bytes, self.logger)
-
-            safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
-            safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
-            today = datetime.date.today().isoformat()
-            combined_name = f"{safe_retailer} {safe_vendor} {today} LABEL.pdf"
-            output_key = str(output_dir / combined_name).lower()
+            _save_individual_label_backup(output_dir, path.stem, source_digest, output_bytes, self.logger)
 
             content_hash = hashlib.sha1(output_bytes).hexdigest()
             with self._lock:
@@ -1652,11 +1737,17 @@ class LabelHandler(FileSystemEventHandler):
                     return
 
             staged_ok = _stage_label_for_daily_rollup(retailer, vendor, output_dir, output_bytes, self.logger)
+            should_persist = False
             with self._lock:
                 if staged_ok:
+                    seen_sources = self._processed_source_digests_by_output.setdefault(output_key, set())
+                    seen_sources.add(source_digest)
                     seen_hashes = self._processed_label_hashes_by_output.setdefault(output_key, set())
                     seen_hashes.add(content_hash)
                     self._processed_label_signatures[key] = current_stable_sig
+                    should_persist = True
+            if should_persist:
+                self._persist_label_dedupe_state()
         finally:
             # Always release the in-progress claim so future runs can re-try.
             with self._lock:
