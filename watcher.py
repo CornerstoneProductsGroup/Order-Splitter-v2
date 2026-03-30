@@ -924,6 +924,33 @@ def _stage_vendor_pdfs_for_daily_rollup(
             logger.warning("[%s] Could not write daily rollup PDF for vendor '%s': %s", retailer, vendor, e)
 
 
+def _save_individual_label_backup(
+    output_dir: Path,
+    source_stem: str,
+    label_data: bytes,
+    logger: logging.Logger,
+) -> None:
+    """Write one resized label as its own timestamped PDF in an 'Individual Labels'
+    subfolder under *output_dir*.  These files are never appended to — they are
+    plain single-label PDFs that can be merged manually if the combined file
+    ever has problems.
+    """
+    backup_dir = output_dir / "Individual Labels"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("[Labels] Could not create individual label backup dir: %s", e)
+        return
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]  # up to seconds
+    filename = f"{source_stem}_{stamp}.pdf"
+    try:
+        (backup_dir / filename).write_bytes(label_data)
+        logger.info("[Labels] Saved individual label → %s", backup_dir / filename)
+    except OSError as e:
+        logger.warning("[Labels] Could not save individual label '%s': %s", filename, e)
+
+
 def _stage_label_for_daily_rollup(
     retailer: str,
     vendor: str,
@@ -1604,6 +1631,11 @@ class LabelHandler(FileSystemEventHandler):
                     return
             else:
                 output_bytes = pdf_bytes
+
+            # Save a resized individual-label backup before attempting the merge.
+            # This gives a clean per-label file to manually combine if the merged
+            # file ever has duplicate or corruption issues.
+            _save_individual_label_backup(output_dir, path.stem, output_bytes, self.logger)
 
             safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
             safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
