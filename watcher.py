@@ -27,6 +27,7 @@ Stop:
 import io
 import hashlib
 import json
+import threading
 import logging
 import os
 import re
@@ -1472,6 +1473,8 @@ class LabelHandler(FileSystemEventHandler):
         self._existing_label_signatures: dict[str, tuple[int, int, int]] = {}
         self._processed_label_signatures: dict[str, tuple[int, int]] = {}
         self._processed_label_hashes_by_output: dict[str, set[str]] = {}
+        self._in_progress: set[str] = set()  # keys currently being processed
+        self._lock = threading.Lock()  # guards all shared state
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
@@ -1525,85 +1528,107 @@ class LabelHandler(FileSystemEventHandler):
             return
 
         key = str(path).lower()
-        current_sig = _file_signature(path)
-        if current_sig is None:
-            return
 
-        current_stable_sig = _file_stable_signature(path)
-        if current_stable_sig is None:
-            return
-
-        baseline_sig = self._existing_label_signatures.get(key)
-        if baseline_sig is not None and current_sig == baseline_sig:
-            return  # unchanged since startup — skip silently
-        if baseline_sig is not None and current_sig != baseline_sig:
-            self._existing_label_signatures.pop(key, None)
-
-        # Prevent duplicate re-appends for unchanged files after initial process.
-        if self._processed_label_signatures.get(key) == current_stable_sig:
-            return
-
-        now = time.monotonic()
-        if now - self._last_seen.get(key, 0.0) < 10.0:
-            return
-        self._last_seen[key] = now
-
-        if not _wait_for_file_ready(path):
-            self.logger.error("[Labels] Timed out waiting for %s to finish writing — skipping.", path.name)
-            return
-
-        route = self._route_for_path(path)
-        if route:
-            retailer = route.retailer.strip() or self._retailer_from_input_path(route.input_path)
-            vendor = route.vendor
-            output_dir = route.output_path
-            resize = route.resize
-        else:
-            # Fallback: no matching config row — use folder name, rollup root, resize
-            retailer = self._retailer_from_input_path(path.parent)
-            vendor = self._vendor_fallback(path)
-            safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
-            output_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
-            resize = True
-
-        self.logger.info(
-            "[Labels] Detected %s label for vendor '%s': %s%s",
-            event_label, vendor, path.name,
-            " (8×11 passthrough — no resize)" if not resize else " (resizing to 4×6)",
-        )
-
-        try:
-            pdf_bytes = path.read_bytes()
-        except OSError as e:
-            self.logger.error("[Labels] Cannot read %s: %s", path.name, e)
-            return
-
-        if resize:
-            try:
-                output_bytes = resize_thermal_label_pdf(pdf_bytes)
-            except Exception as e:
-                self.logger.exception("[Labels] Error resizing %s: %s", path.name, e)
+        # ── Gate check (thread-safe) ───────────────────────────────────────
+        # The Observer thread and the main-loop polling thread can both call
+        # this method concurrently for the same file.  All shared-state reads
+        # and the _in_progress mark must be atomic.
+        with self._lock:
+            current_sig = _file_signature(path)
+            if current_sig is None:
                 return
-        else:
-            output_bytes = pdf_bytes
 
-        safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
-        safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
-        today = datetime.date.today().isoformat()
-        combined_name = f"{safe_retailer} {safe_vendor} {today} LABEL.pdf"
-        output_key = str(output_dir / combined_name).lower()
+            current_stable_sig = _file_stable_signature(path)
+            if current_stable_sig is None:
+                return
 
-        content_hash = hashlib.sha1(output_bytes).hexdigest()
-        seen_hashes = self._processed_label_hashes_by_output.setdefault(output_key, set())
-        if content_hash in seen_hashes:
-            self.logger.info("[Labels] Duplicate label content skipped for vendor '%s': %s", vendor, path.name)
-            self._processed_label_signatures[key] = current_stable_sig
-            return
+            baseline_sig = self._existing_label_signatures.get(key)
+            if baseline_sig is not None and current_sig == baseline_sig:
+                return  # unchanged since startup — skip silently
+            if baseline_sig is not None and current_sig != baseline_sig:
+                self._existing_label_signatures.pop(key, None)
 
-        staged_ok = _stage_label_for_daily_rollup(retailer, vendor, output_dir, output_bytes, self.logger)
-        if staged_ok:
-            seen_hashes.add(content_hash)
-            self._processed_label_signatures[key] = current_stable_sig
+            # Already successfully processed and file hasn't changed.
+            if self._processed_label_signatures.get(key) == current_stable_sig:
+                return
+
+            # Already being processed right now by another thread.
+            if key in self._in_progress:
+                return
+
+            now = time.monotonic()
+            if now - self._last_seen.get(key, 0.0) < 30.0:
+                return
+            self._last_seen[key] = now
+
+            # Claim this key — any concurrent call will see it and bail out.
+            self._in_progress.add(key)
+
+        # ── Long-running work (outside the lock so other files aren't blocked) ──
+        try:
+            if not _wait_for_file_ready(path):
+                self.logger.error("[Labels] Timed out waiting for %s to finish writing — skipping.", path.name)
+                return
+
+            route = self._route_for_path(path)
+            if route:
+                retailer = route.retailer.strip() or self._retailer_from_input_path(route.input_path)
+                vendor = route.vendor
+                output_dir = route.output_path
+                resize = route.resize
+            else:
+                # Fallback: no matching config row — use folder name, rollup root, resize
+                retailer = self._retailer_from_input_path(path.parent)
+                vendor = self._vendor_fallback(path)
+                safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+                output_dir = DAILY_VENDOR_ROLLUP_ROOT / safe_vendor
+                resize = True
+
+            self.logger.info(
+                "[Labels] Detected %s label for vendor '%s': %s%s",
+                event_label, vendor, path.name,
+                " (8×11 passthrough — no resize)" if not resize else " (resizing to 4×6)",
+            )
+
+            try:
+                pdf_bytes = path.read_bytes()
+            except OSError as e:
+                self.logger.error("[Labels] Cannot read %s: %s", path.name, e)
+                return
+
+            if resize:
+                try:
+                    output_bytes = resize_thermal_label_pdf(pdf_bytes)
+                except Exception as e:
+                    self.logger.exception("[Labels] Error resizing %s: %s", path.name, e)
+                    return
+            else:
+                output_bytes = pdf_bytes
+
+            safe_vendor = re.sub(r"[^\w\-. ]+", "_", vendor).strip() or "UNKNOWN"
+            safe_retailer = re.sub(r"[^\w\-. ]+", " ", retailer).strip() or "Retailer"
+            today = datetime.date.today().isoformat()
+            combined_name = f"{safe_retailer} {safe_vendor} {today} LABEL.pdf"
+            output_key = str(output_dir / combined_name).lower()
+
+            content_hash = hashlib.sha1(output_bytes).hexdigest()
+            with self._lock:
+                seen_hashes = self._processed_label_hashes_by_output.setdefault(output_key, set())
+                if content_hash in seen_hashes:
+                    self.logger.info("[Labels] Duplicate label content skipped for vendor '%s': %s", vendor, path.name)
+                    self._processed_label_signatures[key] = current_stable_sig
+                    return
+
+            staged_ok = _stage_label_for_daily_rollup(retailer, vendor, output_dir, output_bytes, self.logger)
+            with self._lock:
+                if staged_ok:
+                    seen_hashes = self._processed_label_hashes_by_output.setdefault(output_key, set())
+                    seen_hashes.add(content_hash)
+                    self._processed_label_signatures[key] = current_stable_sig
+        finally:
+            # Always release the in-progress claim so future runs can re-try.
+            with self._lock:
+                self._in_progress.discard(key)
 
     def poll_all_inputs(self) -> None:
         """Polling fallback for network shares where file-system events can be missed."""
