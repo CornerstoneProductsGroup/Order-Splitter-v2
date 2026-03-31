@@ -430,6 +430,19 @@ def _fit_rect_contain(dst_w: float, dst_h: float, src_w: float, src_h: float) ->
     return fitz.Rect(x0, y0, x0 + w, y0 + h)
 
 
+def _save_pdf_bytes_compact(doc: fitz.Document) -> bytes:
+    buf = BytesIO()
+    doc.save(
+        buf,
+        garbage=3,
+        deflate=True,
+        deflate_images=True,
+        use_objstms=1,
+        compression_effort=100,
+    )
+    return buf.getvalue()
+
+
 def resize_thermal_label_pdf(pdf_bytes: bytes) -> bytes:
     """Crop a 4×6 thermal label off each page of an 8.5×11 PDF and re-pack it
     onto a proper 4×6 page (288×432 pt).
@@ -457,13 +470,13 @@ def resize_thermal_label_pdf(pdf_bytes: bytes) -> bytes:
             LABEL_OUTPUT_WIDTH_PT, LABEL_OUTPUT_HEIGHT_PT,
             float(pix.width), float(pix.height),
         )
-        page.insert_image(img_rect, pixmap=pix)
+        gray_png = fitz.Pixmap(fitz.csGRAY, pix).tobytes("png")
+        page.insert_image(img_rect, stream=gray_png)
 
-    buf = BytesIO()
-    out_doc.save(buf)
+    output_bytes = _save_pdf_bytes_compact(out_doc)
     out_doc.close()
     src_doc.close()
-    return buf.getvalue()
+    return output_bytes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
