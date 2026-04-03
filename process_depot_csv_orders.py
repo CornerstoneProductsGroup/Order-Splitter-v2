@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import math
 import re
 import shutil
 from dataclasses import dataclass
@@ -127,6 +128,8 @@ def _norm_sku(value: object) -> str:
 
 
 def _parse_int(value: object, default: int = 0) -> int:
+    if pd.isna(value):
+        return default
     txt = _norm_text(value)
     if not txt:
         return default
@@ -138,12 +141,17 @@ def _parse_int(value: object, default: int = 0) -> int:
 
 
 def _parse_float(value: object, default: float = 0.0) -> float:
+    if pd.isna(value):
+        return default
     txt = _norm_text(value)
     if not txt:
         return default
     txt = txt.replace(",", "")
     try:
-        return float(txt)
+        parsed = float(txt)
+        if math.isnan(parsed):
+            return default
+        return parsed
     except ValueError:
         return default
 
@@ -189,7 +197,8 @@ def _weight_mode_from_row(weight_mode: str, fixed_box_weight: float | None) -> s
 
 def _box_weight_for_rule(rule: SkuRule, package_units: int, package_count: int) -> float:
     if rule.weight_mode == "fixed":
-        return package_count * (rule.fixed_box_weight or 0.0)
+        fixed_weight = rule.fixed_box_weight or 0.0
+        return package_count * fixed_weight
     return package_units * rule.unit_weight
 
 
@@ -256,7 +265,7 @@ def load_sku_rules(path: Path) -> dict[str, list[SkuRule]]:
     col_printer = _find_col(df, ["Printer", "LABEL_PRINTER_ID"], required=True)
     col_box_weight = _find_col(
         df,
-        ["BoxWeight", "FixedBoxWeight", "FlatWeight", "LabelWeight", "ShipmentWeight"],
+        ["BoxWeight", "Box Weight", "FixedBoxWeight", "Fixed Box Weight", "FlatWeight", "LabelWeight", "ShipmentWeight"],
     )
     col_weight_mode = _find_col(df, ["WeightMode", "Weight Type", "Weight Basis", "WeightMethod"])
 
