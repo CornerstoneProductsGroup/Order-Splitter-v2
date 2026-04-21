@@ -15,11 +15,15 @@ SKU weights and label splits use the same rules model as Depot CSV
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import hashlib
+import json
 import logging
 import os
 import re
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +33,125 @@ import pandas as pd
 import process_depot_csv_orders as depot
 
 _LOG = logging.getLogger(__name__)
+
+# Same folder as watcher.py — empty file pauses all automation (see watcher module docstring).
+_AUTOMATION_STOP_FILE = Path(__file__).resolve().parent / "AUTOMATION_STOP.txt"
+
+
+class LowesFedexHalt(Exception):
+    """Skip Lowe's processing without treating it as a bug (watcher catches by ``code``)."""
+
+    __slots__ = ("code", "detail")
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def _lowes_automation_blocked_reason() -> str | None:
+    """Return a reason string if Lowe's FedEx must not run (mirrors watcher.py master + CSV flags)."""
+    if os.environ.get("ORDER_SPLITTER_DISABLE_ALL_AUTOMATION", "0").strip().lower() in {"1", "true", "yes", "y"}:
+        return "ORDER_SPLITTER_DISABLE_ALL_AUTOMATION"
+    if os.environ.get("ORDER_SPLITTER_DISABLE_CSV_WATCH", "0").strip().lower() in {"1", "true", "yes", "y"}:
+        return "ORDER_SPLITTER_DISABLE_CSV_WATCH"
+    try:
+        if _AUTOMATION_STOP_FILE.is_file():
+            return f"file {_AUTOMATION_STOP_FILE}"
+    except OSError:
+        pass
+    return None
+
+
+def _sha256_file(path: Path) -> str | None:
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1048576), b""):
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _persist_state_path(mapping_xlsx: Path) -> Path:
+    return mapping_xlsx.resolve().parent / ".lowes_fedex_last_run.json"
+
+
+def _load_persist_state(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _persist_is_recent_duplicate(mapping_xlsx: Path, stem: str, content_hash: str, window_sec: float = 86400.0) -> bool:
+    by = _load_persist_state(_persist_state_path(mapping_xlsx)).get("by_stem")
+    if not isinstance(by, dict):
+        return False
+    entry = by.get(stem)
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("sha256") != content_hash:
+        return False
+    try:
+        return time.time() - float(entry.get("ts", 0)) < window_sec
+    except (TypeError, ValueError):
+        return False
+
+
+def _persist_record_success(mapping_xlsx: Path, stem: str, content_hash: str) -> None:
+    path = _persist_state_path(mapping_xlsx)
+    state = _load_persist_state(path)
+    by = state.get("by_stem")
+    if not isinstance(by, dict):
+        by = {}
+    by[stem] = {"sha256": content_hash, "ts": time.time()}
+    state["by_stem"] = by
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+@contextlib.contextmanager
+def _stem_process_lock(mapping_xlsx: Path, stem: str):
+    """Exclusive lock for one Lowe's stem (any Python process using this mapping folder)."""
+    lock_dir = mapping_xlsx.resolve().parent
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.sha256(stem.encode("utf-8", errors="surrogateescape")).hexdigest()[:28]
+    lock_path = lock_dir / f".__lowes_fedex_lock_{tag}"
+    stale_sec = 900.0
+    for attempt in range(2):
+        try:
+            if lock_path.exists():
+                try:
+                    if time.time() - lock_path.stat().st_mtime > stale_sec:
+                        lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{os.getpid()}\n".encode("ascii", errors="replace"))
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            if attempt == 0:
+                time.sleep(0.1)
+                continue
+            raise LowesFedexHalt("busy", str(lock_path)) from None
+    try:
+        yield lock_path
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _cleanup_lowes_timestamp_collision_artifacts(directories: tuple[Path, ...], raw_stem: str) -> int:
@@ -542,11 +665,30 @@ def process_one_csv(
     output_dir: Path,
     archive_dir: Path,
     dry_run: bool = False,
+    *,
+    force: bool = False,
 ) -> tuple[Path | None, int, int, Path | None]:
     """Process one raw Lowe's CSV into a FedEx upload workbook.
 
     Returns ``(output_path_or_none, output_row_count, unknown_sku_count, archive_path_or_none)``.
+
+    Unless ``force=True``, processing is refused when CSV automation is disabled or
+    ``AUTOMATION_STOP.txt`` is present (same rules as ``watcher.py``), so stray schedulers
+    cannot bypass the watcher.
     """
+    if not force:
+        blocked = _lowes_automation_blocked_reason()
+        if blocked:
+            raise LowesFedexHalt("paused", blocked)
+
+    content_hash = _sha256_file(raw_csv)
+    if content_hash is None:
+        raise ValueError(f"Could not read file for hashing: {raw_csv}")
+
+    if not dry_run and not force:
+        if _persist_is_recent_duplicate(mapping_xlsx, raw_csv.stem, content_hash):
+            raise LowesFedexHalt("duplicate", raw_csv.stem)
+
     mapping = load_lowes_fedex_mapping(mapping_xlsx)
     resolved_weights_xlsx, weights_sheet = _resolve_weights_source(mapping_xlsx, weights_xlsx, mapping.weights_selector)
     rules = depot.load_sku_rules(resolved_weights_xlsx, weights_sheet)
@@ -558,34 +700,36 @@ def process_one_csv(
 
     stem = raw_csv.stem
     out_path: Path | None = None
-    try:
-        out_path, out_rows, unknown = process_file(
-            raw_csv,
-            rules,
-            mapping,
-            output_dir,
-            uproot_skip,
-            output_basename=f"{stem} Output",
-        )
-        archived_input = _archive_move_replace(
-            raw_csv, archive_dir, f"{stem} Input{raw_csv.suffix}",
-        )
-        _archive_copy(out_path, archive_dir, f"{stem} Output{out_path.suffix}")
-    except Exception:
-        if out_path is not None:
-            try:
-                if out_path.exists():
-                    out_path.unlink()
-            except OSError:
-                pass
-        raise
-    n_legacy = _cleanup_lowes_timestamp_collision_artifacts((output_dir, archive_dir), stem)
-    if n_legacy:
-        _LOG.info(
-            "Removed %d legacy timestamp collision file(s) for %r (Output_*.xlsx / Input_*.csv)",
-            n_legacy,
-            stem,
-        )
+    with _stem_process_lock(mapping_xlsx, stem):
+        try:
+            out_path, out_rows, unknown = process_file(
+                raw_csv,
+                rules,
+                mapping,
+                output_dir,
+                uproot_skip,
+                output_basename=f"{stem} Output",
+            )
+            archived_input = _archive_move_replace(
+                raw_csv, archive_dir, f"{stem} Input{raw_csv.suffix}",
+            )
+            _archive_copy(out_path, archive_dir, f"{stem} Output{out_path.suffix}")
+        except Exception:
+            if out_path is not None:
+                try:
+                    if out_path.exists():
+                        out_path.unlink()
+                except OSError:
+                    pass
+            raise
+        n_legacy = _cleanup_lowes_timestamp_collision_artifacts((output_dir, archive_dir), stem)
+        if n_legacy:
+            _LOG.info(
+                "Removed %d legacy timestamp collision file(s) for %r (Output_*.xlsx / Input_*.csv)",
+                n_legacy,
+                stem,
+            )
+        _persist_record_success(mapping_xlsx, stem, content_hash)
     return out_path, out_rows, unknown, archived_input
 
 
@@ -597,6 +741,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", type=Path, required=True, help="Output folder for FedEx xlsx")
     p.add_argument("--archive", type=Path, required=True, help="Archive folder for source CSV copies")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Run even when CSV automation is disabled or AUTOMATION_STOP.txt exists (operator override)",
+    )
     return p.parse_args()
 
 
@@ -609,6 +758,7 @@ def main() -> None:
         args.output,
         args.archive,
         dry_run=args.dry_run,
+        force=args.force,
     )
     if args.dry_run:
         print(f"DRY RUN: would write {rows} row(s), unknown SKU rows skipped: {unk}")

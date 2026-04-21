@@ -1886,35 +1886,45 @@ class LoweFedexCSVHandler(FileSystemEventHandler):
                     archive_dir=self.archive_dir,
                     dry_run=self.dry_run,
                 )
-                if self.dry_run:
-                    self.logger.info(
-                        "[Lowe's FedEx CSV] DRY RUN for %s → would create %d row(s)",
-                        path.name,
-                        out_rows,
-                    )
-                else:
-                    self.logger.info(
-                        "[Lowe's FedEx CSV] Processed %s -> %s (%d rows)",
-                        path.name,
-                        out_path,
-                        out_rows,
-                    )
-                    self.logger.info(
-                        "[Lowe's FedEx CSV] Raw CSV moved to archive (removed from input) -> %s",
-                        archived_to,
-                    )
-                if unknown_skus:
-                    self.logger.warning(
-                        "[Lowe's FedEx CSV] %d source row(s) skipped (SKU not in weights workbook)",
-                        unknown_skus,
-                    )
-                with self._lowe_csv_lock:
-                    self._processed_csv_sha256[key] = content_hash
-                    self._processed_stem_sha256[stem_key] = content_hash
-                self._failure_quiet_until.pop(stem_key, None)
-            except Exception as e:
-                self.logger.exception("[Lowe's FedEx CSV] Error processing %s: %s", path.name, e)
-                self._failure_quiet_until[stem_key] = time.monotonic() + 300.0
+            except lowes_fedex_csv.LowesFedexHalt as halt:
+                if halt.code == "duplicate":
+                    with self._lowe_csv_lock:
+                        self._processed_csv_sha256[key] = content_hash
+                        self._processed_stem_sha256[stem_key] = content_hash
+                elif halt.code == "busy":
+                    self._failure_quiet_until[stem_key] = time.monotonic() + 120.0
+                elif halt.code == "paused":
+                    self.logger.info("[Lowe's FedEx CSV] Refused by process guard: %s", halt.detail)
+                return
+            if self.dry_run:
+                self.logger.info(
+                    "[Lowe's FedEx CSV] DRY RUN for %s → would create %d row(s)",
+                    path.name,
+                    out_rows,
+                )
+            else:
+                self.logger.info(
+                    "[Lowe's FedEx CSV] Processed %s -> %s (%d rows)",
+                    path.name,
+                    out_path,
+                    out_rows,
+                )
+                self.logger.info(
+                    "[Lowe's FedEx CSV] Raw CSV moved to archive (removed from input) -> %s",
+                    archived_to,
+                )
+            if unknown_skus:
+                self.logger.warning(
+                    "[Lowe's FedEx CSV] %d source row(s) skipped (SKU not in weights workbook)",
+                    unknown_skus,
+                )
+            with self._lowe_csv_lock:
+                self._processed_csv_sha256[key] = content_hash
+                self._processed_stem_sha256[stem_key] = content_hash
+            self._failure_quiet_until.pop(stem_key, None)
+        except Exception as e:
+            self.logger.exception("[Lowe's FedEx CSV] Error processing %s: %s", path.name, e)
+            self._failure_quiet_until[stem_key] = time.monotonic() + 300.0
         finally:
             with self._lowe_csv_lock:
                 self._lowe_csv_inflight.discard(key)

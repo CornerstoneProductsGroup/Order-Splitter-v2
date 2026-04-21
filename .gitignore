@@ -9,3 +9,6 @@ venv/
 
 *.log
 .depot_csv_watch_state.json
+
+.lowes_fedex_last_run.json
+.__lowes_fedex_lock_*
