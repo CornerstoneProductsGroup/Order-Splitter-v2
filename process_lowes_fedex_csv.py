@@ -34,10 +34,6 @@ import process_depot_csv_orders as depot
 
 _LOG = logging.getLogger(__name__)
 
-# Same folder as watcher.py — empty file pauses all automation (see watcher module docstring).
-_AUTOMATION_STOP_FILE = Path(__file__).resolve().parent / "AUTOMATION_STOP.txt"
-
-
 class LowesFedexHalt(Exception):
     """Skip Lowe's processing without treating it as a bug (watcher catches by ``code``)."""
 
@@ -50,16 +46,9 @@ class LowesFedexHalt(Exception):
 
 
 def _lowes_automation_blocked_reason() -> str | None:
-    """Return a reason string if Lowe's FedEx must not run (mirrors watcher.py master + CSV flags)."""
-    if os.environ.get("ORDER_SPLITTER_DISABLE_ALL_AUTOMATION", "0").strip().lower() in {"1", "true", "yes", "y"}:
-        return "ORDER_SPLITTER_DISABLE_ALL_AUTOMATION"
+    """Lowe's FedEx runs only when the CSV watcher is allowed (same as Depot — ``ORDER_SPLITTER_DISABLE_CSV_WATCH``)."""
     if os.environ.get("ORDER_SPLITTER_DISABLE_CSV_WATCH", "0").strip().lower() in {"1", "true", "yes", "y"}:
         return "ORDER_SPLITTER_DISABLE_CSV_WATCH"
-    try:
-        if _AUTOMATION_STOP_FILE.is_file():
-            return f"file {_AUTOMATION_STOP_FILE}"
-    except OSError:
-        pass
     return None
 
 
@@ -672,9 +661,8 @@ def process_one_csv(
 
     Returns ``(output_path_or_none, output_row_count, unknown_sku_count, archive_path_or_none)``.
 
-    Unless ``force=True``, processing is refused when CSV automation is disabled or
-    ``AUTOMATION_STOP.txt`` is present (same rules as ``watcher.py``), so stray schedulers
-    cannot bypass the watcher.
+    Unless ``force=True``, processing is refused when ``ORDER_SPLITTER_DISABLE_CSV_WATCH`` is set
+    (CSV watcher off).  The watcher also applies master pause / stop file before calling here.
     """
     if not force:
         blocked = _lowes_automation_blocked_reason()
@@ -744,7 +732,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--force",
         action="store_true",
-        help="Run even when CSV automation is disabled or AUTOMATION_STOP.txt exists (operator override)",
+        help="Run even when ORDER_SPLITTER_DISABLE_CSV_WATCH is set (operator override only)",
     )
     return p.parse_args()
 

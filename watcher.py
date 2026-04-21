@@ -15,6 +15,8 @@ disabled):
 
   * **Depot** CSV → split CSV outputs + archive.
   * **Lowe's** raw CSV → FedEx upload workbook + archive.
+  * Both use **polling only** on the CSV inbox folders (no file-create/modify events) so network
+    shares do not fire the same job twice and create duplicate outputs.
 
 Launchers in this folder:
 
@@ -1591,6 +1593,11 @@ class PDFHandler(FileSystemEventHandler):
 
 
 class DepotCSVHandler(FileSystemEventHandler):
+    """Depot CSV: **poll-only** on the input folder (no create/modify/move handlers).
+
+    Network shares often emit duplicate or flaky file events; polling alone avoids double-processing.
+    """
+
     def __init__(
         self,
         rules_path: Path,
@@ -1733,23 +1740,21 @@ class DepotCSVHandler(FileSystemEventHandler):
             self._process_if_csv(fp, "polled")
 
     def on_created(self, event) -> None:  # type: ignore[override]
-        if event.is_directory:
-            return
-        self._process_if_csv(Path(event.src_path), "new")
+        # Poll-only (see class docstring).
+        return
 
     def on_moved(self, event) -> None:  # type: ignore[override]
-        if event.is_directory:
-            return
-        self._process_if_csv(Path(event.dest_path), "moved")
+        return
 
     def on_modified(self, event) -> None:  # type: ignore[override]
-        if event.is_directory:
-            return
-        self._process_if_csv(Path(event.src_path), "modified")
+        return
 
 
 class LoweFedexCSVHandler(FileSystemEventHandler):
-    """Watch ``LOWES_FEDEX_CSV_INPUT_DIR`` for raw Lowe's CSVs and emit FedEx upload workbooks."""
+    """Lowe's FedEx CSV: **poll-only** on ``LOWES_FEDEX_CSV_INPUT_DIR`` (no create/modify/move handlers).
+
+    Same reason as Depot CSV — SMB duplicate events were causing repeated runs and extra output files.
+    """
 
     def __init__(
         self,
@@ -1774,7 +1779,7 @@ class LoweFedexCSVHandler(FileSystemEventHandler):
         self._lowe_csv_inflight: set[str] = set()
         self._last_seen: dict[str, float] = {}
         self._failure_quiet_until: dict[str, float] = {}
-        self._poll_interval_sec = 5.0
+        self._poll_interval_sec = 6.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
 
@@ -1952,19 +1957,14 @@ class LoweFedexCSVHandler(FileSystemEventHandler):
             self._process_if_csv(fp, "polled")
 
     def on_created(self, event) -> None:  # type: ignore[override]
-        if event.is_directory:
-            return
-        self._process_if_csv(Path(event.src_path), "new")
+        # Poll-only (see class docstring).
+        return
 
     def on_moved(self, event) -> None:  # type: ignore[override]
-        if event.is_directory:
-            return
-        self._process_if_csv(Path(event.dest_path), "moved")
+        return
 
     def on_modified(self, event) -> None:  # type: ignore[override]
-        if event.is_directory:
-            return
-        self._process_if_csv(Path(event.src_path), "modified")
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
