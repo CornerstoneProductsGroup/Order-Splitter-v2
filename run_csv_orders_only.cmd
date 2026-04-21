@@ -1,16 +1,14 @@
 @echo off
 setlocal
 
-rem Full watcher: PDF watcher (retailer packing-slip PDFs + WorldShip label sizing)
-rem              + CSV watcher (Depot + Lowe's FedEx). See watcher.py module docstring.
-rem Optional env: ORDER_SPLITTER_DISABLE_PDF_WATCH, ORDER_SPLITTER_DISABLE_CSV_WATCH, ORDER_SPLITTER_DISABLE_LABEL_WATCH
+rem CSV watcher only: Depot + Lowe's FedEx CSV (outputs + archives).
+rem PDF watcher (packing slips + WorldShip labels) stays off for this process.
 
-rem Always run from this script's folder
 cd /d "%~dp0"
 
-set "LOG=%~dp0watcher.log"
+set "LOG=%~dp0watcher_csv_only.log"
 echo ================================================== >> "%LOG%"
-echo [%date% %time%] Starting watcher launcher >> "%LOG%"
+echo [%date% %time%] Starting CSV-only watcher launcher >> "%LOG%"
 echo [%date% %time%] Working dir: %cd% >> "%LOG%"
 
 set "PY=%~dp0.venv\Scripts\python.exe"
@@ -20,13 +18,14 @@ if not exist "%PY%" (
 
 if not exist "%PY%" (
 	echo [%date% %time%] ERROR: No project venv python found. Expected .venv\Scripts\python.exe or venv\Scripts\python.exe >> "%LOG%"
-	echo [%date% %time%] ERROR: Create venv and install requirements before running scheduled task. >> "%LOG%"
 	exit /b 2
 )
 
 echo [%date% %time%] Python: %PY% >> "%LOG%"
 
-"%PY%" watcher.py >> "%LOG%" 2>&1
+set "ORDER_SPLITTER_DISABLE_PDF_WATCH=1"
+set "ORDER_SPLITTER_DISABLE_LABEL_WATCH=1"
+"%PY%" watcher.py --pdf-off >> "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 echo [%date% %time%] watcher.py exited with code %EC% >> "%LOG%"
 exit /b %EC%

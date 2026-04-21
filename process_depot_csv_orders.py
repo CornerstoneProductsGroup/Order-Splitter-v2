@@ -127,6 +127,21 @@ def _norm_sku(value: object) -> str:
     return s
 
 
+def _norm_sku_loose(value: object) -> str:
+    """SKU key tolerant of Excel numeric cells vs CSV text (e.g. 12345.0 vs 12345)."""
+    s = _norm_sku(value)
+    if not s:
+        return ""
+    if re.fullmatch(r"[0-9]+\.[0-9]+", s):
+        try:
+            f = float(s)
+            if f == int(f):
+                return str(int(f))
+        except ValueError:
+            pass
+    return s
+
+
 def _parse_int(value: object, default: int = 0) -> int:
     if pd.isna(value):
         return default
@@ -167,7 +182,7 @@ def _normalize_postal_code(postal_code: str, country_code: str) -> str:
     country = _norm_text(country_code).upper()
 
     # Preserve leading-zero ZIP codes for US addresses.
-    if country == "US":
+    if country in {"US", "USA"}:
         digits_only = re.sub(r"\D", "", postal)
         if digits_only and len(digits_only) < 5:
             return digits_only.zfill(5)
@@ -241,11 +256,88 @@ def _build_package_plan(total_units: int, rules: list[SkuRule]) -> list[tuple[Sk
     return grouped
 
 
-def load_sku_rules(path: Path) -> dict[str, list[SkuRule]]:
+def uproot_placeholder_skus_from_rules_workbook(
+    path: Path, sheet_name: str | int | None = None,
+) -> frozenset[str]:
+    """SKUs on rows that have a SKU but no usable weight (``load_sku_rules`` skips those rows).
+
+    Bottom rows with blank/zero weight (skipped by ``load_sku_rules``) can be treated as Uproot-only SKUs.
+    """
+    if not path.exists():
+        return frozenset()
+    try:
+        rules = load_sku_rules(path, sheet_name)
+    except ValueError:
+        rules = {}
+    loaded_loose = frozenset(_norm_sku_loose(k) for k in rules.keys())
+
+    df = pd.read_excel(path, sheet_name=sheet_name if sheet_name is not None else 0)
+    col_sku = _find_col(df, ["SKU"], required=True)
+    col_weight = _find_col(
+        df,
+        ["UnitWeight", "Unit Weight", "Weight", "EachWeight", "ItemWeight", "Label Weight"],
+        required=True,
+    )
+    col_max = _find_col(
+        df,
+        ["MaxUnitsPerBox", "Max Unit per box", "MaxUnits", "Max Per Box", "UnitsPerBox"],
+        required=True,
+    )
+    col_min = _find_col(
+        df,
+        ["MinUnitsPerBox", "Min Unit per box", "MinUnits", "Min Qty", "MinQty", "Min Order Qty"],
+    )
+    col_box_weight = _find_col(
+        df,
+        ["BoxWeight", "Box Weight", "FixedBoxWeight", "Fixed Box Weight", "FlatWeight", "LabelWeight", "ShipmentWeight"],
+    )
+    col_weight_mode = _find_col(df, ["WeightMode", "Weight Type", "Weight Basis", "WeightMethod"])
+
+    out: set[str] = set()
+    for _, row in df.iterrows():
+        sku_raw = row.get(col_sku)  # type: ignore[arg-type]
+        sku = _norm_sku(sku_raw)
+        if not sku:
+            continue
+
+        unit_weight = _parse_float(row.get(col_weight), 0.0)  # type: ignore[arg-type]
+        fixed_box_weight = _parse_float(row.get(col_box_weight), 0.0) if col_box_weight else 0.0
+        max_units = _parse_int(row.get(col_max), 1)  # type: ignore[arg-type]
+        min_units = _parse_int(row.get(col_min), 1) if col_min else 1
+        if max_units <= 0:
+            max_units = 1
+        if min_units <= 0:
+            min_units = 1
+        if min_units > max_units:
+            min_units = max_units
+
+        raw_weight_mode = _norm_text(row.get(col_weight_mode)) if col_weight_mode else ""
+        parsed_fixed_box_weight = fixed_box_weight if fixed_box_weight > 0 else None
+        weight_mode = _weight_mode_from_row(raw_weight_mode, parsed_fixed_box_weight)
+        if weight_mode == "fixed" and parsed_fixed_box_weight is None:
+            parsed_fixed_box_weight = unit_weight
+
+        if weight_mode == "fixed":
+            if (parsed_fixed_box_weight or 0.0) <= 0:
+                sk = _norm_sku_loose(sku_raw)
+                if sk and sk not in loaded_loose:
+                    out.add(sk)
+                continue
+        else:
+            if unit_weight <= 0:
+                sk = _norm_sku_loose(sku_raw)
+                if sk and sk not in loaded_loose:
+                    out.add(sk)
+                continue
+
+    return frozenset(out)
+
+
+def load_sku_rules(path: Path, sheet_name: str | int | None = None) -> dict[str, list[SkuRule]]:
     if not path.exists():
         raise FileNotFoundError(f"Rules file not found: {path}")
 
-    df = pd.read_excel(path)
+    df = pd.read_excel(path, sheet_name=sheet_name if sheet_name is not None else 0)
 
     col_sku = _find_col(df, ["SKU"], required=True)
     col_weight = _find_col(
@@ -262,7 +354,7 @@ def load_sku_rules(path: Path) -> dict[str, list[SkuRule]]:
         df,
         ["MinUnitsPerBox", "Min Unit per box", "MinUnits", "Min Qty", "MinQty", "Min Order Qty"],
     )
-    col_printer = _find_col(df, ["Printer", "LABEL_PRINTER_ID"], required=True)
+    col_printer = _find_col(df, ["Printer", "LABEL_PRINTER_ID"], required=False)
     col_box_weight = _find_col(
         df,
         ["BoxWeight", "Box Weight", "FixedBoxWeight", "Fixed Box Weight", "FlatWeight", "LabelWeight", "ShipmentWeight"],
@@ -302,12 +394,20 @@ def load_sku_rules(path: Path) -> dict[str, list[SkuRule]]:
         if min_units > max_units:
             min_units = max_units
 
-        printer = _norm_text(row.get(col_printer))  # type: ignore[arg-type]
+        printer = _norm_text(row.get(col_printer)) if col_printer else ""  # type: ignore[arg-type]
         raw_weight_mode = _norm_text(row.get(col_weight_mode)) if col_weight_mode else ""
         parsed_fixed_box_weight = fixed_box_weight if fixed_box_weight > 0 else None
         weight_mode = _weight_mode_from_row(raw_weight_mode, parsed_fixed_box_weight)
         if weight_mode == "fixed" and parsed_fixed_box_weight is None:
             parsed_fixed_box_weight = unit_weight
+
+        # Skip placeholder rows (SKU present but no weight / not labeling yet).
+        if weight_mode == "fixed":
+            if (parsed_fixed_box_weight or 0.0) <= 0:
+                continue
+        else:
+            if unit_weight <= 0:
+                continue
 
         vendor_name = _norm_text(row.get(col_vendor)) if col_vendor else ""
         if col_po_desc:

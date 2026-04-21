@@ -1,19 +1,41 @@
 """
-File Watcher — Auto-processes PDFs dropped into retailer watch folders.
+Order Splitter file watcher (``watcher.py``) — **only** this process watches the configured UNC inboxes.
 
-Watch folders (created automatically on first run):
-  ./watch/home_depot/      →  processed as Home Depot orders
-  ./watch/lowes/           →  processed as Lowe's orders
-  ./watch/tractor_supply/  →  processed as Tractor Supply orders
+There are two feature stacks (each is active only while this process is running and that stack is not
+disabled):
 
-Output is written to:
-  ./watch/output/
+**PDF watcher** — ``ORDER_SPLITTER_DISABLE_PDF_WATCH`` (unset / 0 = on)
 
-Vendor PDFs are also staged daily for email dispatch in:
-  ./email_staging/{YYYY-MM-DD}/{VendorName}/
+  * Retailer **packing-slip PDFs** (Home Depot, Lowe's, Tractor Supply) → split ZIP outputs.
+  * **WorldShip label PDFs** (sizing / merge) — part of the same PDF stack.  Labels never run when
+    the PDF watcher is off.  Optional sub-switch: ``ORDER_SPLITTER_DISABLE_LABEL_WATCH`` turns labels
+    off while packing-slip PDF processing stays on.
 
-Run the watcher:
-  python watcher.py
+**CSV watcher** — ``ORDER_SPLITTER_DISABLE_CSV_WATCH`` (unset / 0 = on)
+
+  * **Depot** CSV → split CSV outputs + archive.
+  * **Lowe's** raw CSV → FedEx upload workbook + archive.
+
+Launchers in this folder:
+
+  * ``run_watcher.cmd`` — PDF watcher + CSV watcher both on (default env).
+  * ``run_pdf_only.cmd`` — PDF watcher on (packing slips + labels per env); **CSV watcher off**.
+  * ``run_csv_orders_only.cmd`` — **CSV watcher on**; PDF watcher (and thus labels) off.
+
+Command-line flags (after logging starts; override env / sidecar):
+
+  ``--csv-off`` — CSV watcher off (Depot + Lowe's FedEx)  
+  ``--pdf-off`` — PDF watcher off (also turns label automation off)  
+  ``--labels-off`` — labels off only; packing-slip PDFs still on  
+  ``--all-off`` / ``--pause`` — master pause (same as ``ORDER_SPLITTER_DISABLE_ALL_AUTOMATION`` + per-stack flags)  
+  ``--no-instance-lock`` — allow a second ``watcher.py`` from this same directory (not recommended)
+
+Optional ``watcher_settings.json`` beside this script: ``disable_csv_watch``, ``disable_pdf_watch``,
+``disable_label_watch``, or ``automation_paused`` set to ``true`` (CLI still wins).
+
+**Emergency pause (no env vars):** create an empty file ``AUTOMATION_STOP.txt`` in the same folder as
+``watcher.py``.  All PDF and CSV processing stops until you delete that file (watcher can keep running).
+``ORDER_SPLITTER_DISABLE_ALL_AUTOMATION=1`` does the same.
 
 Send today's vendor emails (Outlook must be open on this machine):
   python send_emails.py
@@ -24,9 +46,11 @@ Stop:
   Ctrl+C
 """
 
+import atexit
 import io
 import hashlib
 import json
+import sys
 import threading
 import logging
 import os
@@ -44,9 +68,46 @@ from dataclasses import dataclass
 import fitz  # PyMuPDF
 import pandas as pd
 import process_depot_csv_orders as depot_csv
+import process_lowes_fedex_csv as lowes_fedex_csv
 from pypdf import PdfReader
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+
+
+def _normalized_dir_key(path: Path) -> str:
+    """Lowercase, normpath directory key so Excel UNC rows match watchdog paths."""
+    try:
+        s = os.path.normpath(str(path))
+    except Exception:
+        s = str(path)
+    return s.rstrip("\\/").lower()
+
+
+def _csv_watch_path_key(path: Path) -> str:
+    """Stable dict key for a CSV path (UNC-safe; matches glob vs watchdog event paths)."""
+    try:
+        s = os.fspath(path)
+        # Long-path and mixed forms from Watchdog / APIs vs Path.glob on SMB.
+        if s.startswith("\\\\?\\UNC\\"):
+            s = "\\\\" + s[8:]
+        elif s.startswith("\\\\?\\") and len(s) > 6:
+            s = os.path.normpath(s[4:])
+        return os.path.normcase(os.path.normpath(s))
+    except Exception:
+        return str(path).lower()
+
+
+def _label_pdfs_in_input_folder(input_path: Path) -> list[Path]:
+    """PDFs directly in the input folder plus one subfolder level (non-recursive watch misses subdirs)."""
+    try:
+        files = list(input_path.glob("*.pdf"))
+        for sub in input_path.iterdir():
+            if sub.is_dir():
+                files.extend(sub.glob("*.pdf"))
+        return files
+    except OSError:
+        return []
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Directories
@@ -83,6 +144,20 @@ CSV_ARCHIVE_DIR = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Depot"
 )
 
+# Lowe's → FedEx upload (raw CSV + mapping workbook + weights workbook).
+LOWES_FEDEX_CSV_INPUT_DIR = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\Lowe's"
+)
+LOWES_FEDEX_CONFIG_DIR = Path(r"C:\OrderSplitter\Lowe's CSV")
+LOWES_FEDEX_CSV_OUTPUT_DIR = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output\CSV File Output\Lowe's"
+)
+LOWES_FEDEX_CSV_ARCHIVE_DIR = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\6-CSV Order Files\z- Archive Lowe's"
+)
+LOWES_FEDEX_MAPPING_XLSX = LOWES_FEDEX_CONFIG_DIR / "Lowe's FedEx mapping.xlsx"
+LOWES_FEDEX_WEIGHTS_XLSX = LOWES_FEDEX_CONFIG_DIR / "Lowe's Weights for Labels.xlsx"
+
 # WorldShip label input: one subfolder **per vendor** under this root.
 #   e.g.  …\5-WorldShip Labels\Post Protector\shipment_label.pdf
 # The watcher watches all vendor subfolders recursively; the vendor name
@@ -90,7 +165,6 @@ CSV_ARCHIVE_DIR = Path(
 LABEL_WATCH_ROOT = Path(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\5-WorldShip Labels"
 )
-LABEL_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_LABEL_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
 
 # Output size for a thermal 4×6 label (in PDF points at 72 pt/in).
 LABEL_OUTPUT_WIDTH_PT  = 4.0 * 72   # 288 pt
@@ -105,8 +179,129 @@ LABEL_ROUTES_XLSX_PATH = Path("Vendor Label Paths (Input-Output).xlsx")
 CSV_RULES_FILENAME = "Weights, Max Units and Printer for CSV routing.xlsx"
 CSV_RULES_XLSX_PATH = Path(CSV_RULES_FILENAME)
 CSV_DRY_RUN = os.environ.get("ORDER_SPLITTER_CSV_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
-CSV_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_CSV_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
-PDF_WATCH_ENABLED = os.environ.get("ORDER_SPLITTER_DISABLE_PDF_WATCH", "0").strip().lower() not in {"1", "true", "yes", "y"}
+
+# Empty file next to watcher.py pauses all automation while the process stays running (remove file to resume).
+_AUTOMATION_STOP_FILE = Path(__file__).resolve().parent / "AUTOMATION_STOP.txt"
+
+
+def _master_automation_allowed_now() -> bool:
+    """Hard pause for every stack: env ``ORDER_SPLITTER_DISABLE_ALL_AUTOMATION`` or ``AUTOMATION_STOP.txt``."""
+    if os.environ.get("ORDER_SPLITTER_DISABLE_ALL_AUTOMATION", "0").strip().lower() in {"1", "true", "yes", "y"}:
+        return False
+    try:
+        return not _AUTOMATION_STOP_FILE.is_file()
+    except OSError:
+        return True
+
+
+def _csv_env_enabled_now() -> bool:
+    """CSV watcher env only (used to attach folder watches); runtime also requires :func:`_master_automation_allowed_now`."""
+    return os.environ.get("ORDER_SPLITTER_DISABLE_CSV_WATCH", "0").strip().lower() not in {
+        "1", "true", "yes", "y",
+    }
+
+
+def _csv_watch_enabled_now() -> bool:
+    """Depot + Lowe's FedEx CSV: env CSV switch **and** master pause (stop file / DISABLE_ALL_AUTOMATION)."""
+    return _master_automation_allowed_now() and _csv_env_enabled_now()
+
+
+def _pdf_env_enabled_now() -> bool:
+    """PDF watcher env only (schedule packing-slip watches)."""
+    return os.environ.get("ORDER_SPLITTER_DISABLE_PDF_WATCH", "0").strip().lower() not in {
+        "1", "true", "yes", "y",
+    }
+
+
+def _pdf_watch_enabled_now() -> bool:
+    """Retailer PDF packing slips **and** master pause."""
+    return _master_automation_allowed_now() and _pdf_env_enabled_now()
+
+
+def _label_env_enabled_now() -> bool:
+    """Label sub-switch (PDF watcher must be enabled in env to schedule labels)."""
+    return os.environ.get("ORDER_SPLITTER_DISABLE_LABEL_WATCH", "0").strip().lower() not in {
+        "1", "true", "yes", "y",
+    }
+
+
+def _label_watch_enabled_now() -> bool:
+    """WorldShip labels: PDF watcher effective (env + master) and label env not disabled."""
+    if not _pdf_watch_enabled_now():
+        return False
+    return _label_env_enabled_now()
+
+
+def _apply_watcher_cli_env_from_argv(argv: list[str]) -> None:
+    """Apply ``--csv-off``, ``--pdf-off``, ``--labels-off``, ``--all-off`` to this process's environment."""
+    flags = {raw.strip().lower() for raw in argv[1:]}
+    if "--all-off" in flags or "--pause" in flags:
+        os.environ["ORDER_SPLITTER_DISABLE_ALL_AUTOMATION"] = "1"
+        os.environ["ORDER_SPLITTER_DISABLE_CSV_WATCH"] = "1"
+        os.environ["ORDER_SPLITTER_DISABLE_PDF_WATCH"] = "1"
+        os.environ["ORDER_SPLITTER_DISABLE_LABEL_WATCH"] = "1"
+        return
+    if flags & {"--csv-off", "--disable-csv", "--no-csv"}:
+        os.environ["ORDER_SPLITTER_DISABLE_CSV_WATCH"] = "1"
+    if flags & {"--pdf-off", "--disable-pdf", "--no-pdf"}:
+        os.environ["ORDER_SPLITTER_DISABLE_PDF_WATCH"] = "1"
+        os.environ["ORDER_SPLITTER_DISABLE_LABEL_WATCH"] = "1"
+    if flags & {"--labels-off", "--disable-labels", "--no-labels"}:
+        os.environ["ORDER_SPLITTER_DISABLE_LABEL_WATCH"] = "1"
+
+
+def _apply_watcher_sidecar_settings(logger: logging.Logger) -> None:
+    """Merge optional ``watcher_settings.json`` beside this script into ``os.environ``."""
+    path = Path(__file__).resolve().parent / "watcher_settings.json"
+    if not path.is_file():
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Could not read watcher sidecar %s: %s", path, e)
+        return
+    if not isinstance(raw, dict):
+        logger.warning("Watcher sidecar %s: expected a JSON object", path)
+        return
+    if raw.get("disable_csv_watch") is True:
+        os.environ["ORDER_SPLITTER_DISABLE_CSV_WATCH"] = "1"
+    if raw.get("disable_pdf_watch") is True:
+        os.environ["ORDER_SPLITTER_DISABLE_PDF_WATCH"] = "1"
+        os.environ["ORDER_SPLITTER_DISABLE_LABEL_WATCH"] = "1"
+    if raw.get("disable_label_watch") is True:
+        os.environ["ORDER_SPLITTER_DISABLE_LABEL_WATCH"] = "1"
+    if raw.get("automation_paused") is True:
+        os.environ["ORDER_SPLITTER_DISABLE_ALL_AUTOMATION"] = "1"
+
+
+def _acquire_watcher_instance_lock(logger: logging.Logger) -> bool:
+    """Avoid two ``watcher.py`` processes on one PC (common cause of duplicate CSV / Excel output)."""
+    flags = {a.strip().lower() for a in sys.argv[1:]}
+    if "--no-instance-lock" in flags:
+        return True
+    lock_path = Path(__file__).resolve().parent / ".watcher_instance.lock"
+
+    def _release() -> None:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii", errors="replace"))
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        logger.error(
+            "Another watcher.py appears to be using %s (delete it if no watcher is running). "
+            "Only one instance per machine should watch the same inbox folders.",
+            lock_path,
+        )
+        return False
+    atexit.register(_release)
+    return True
 
 
 @dataclass
@@ -1115,6 +1310,28 @@ def _file_stable_signature(path: Path) -> tuple[int, int] | None:
     return (int(st.st_mtime_ns), int(st.st_size))
 
 
+def _sha256_file(path: Path) -> str | None:
+    """Full-file SHA256 for CSV dedupe. SMB mtime can jitter after reads; content does not."""
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _path_is_same_or_under(path: Path, root: Path) -> bool:
+    """True if ``path`` is ``root`` or inside ``root`` (UNC-safe string compare)."""
+    try:
+        p = os.path.normcase(os.path.normpath(os.fspath(path)))
+        r = os.path.normcase(os.path.normpath(os.fspath(root)))
+    except Exception:
+        return False
+    return p == r or p.startswith(r + os.sep)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main processing function
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1271,6 +1488,10 @@ class PDFHandler(FileSystemEventHandler):
         self.logger    = logger
         self._last_seen: dict[str, float] = {}
         self._existing_pdf_signatures: dict[str, tuple[int, int, int]] = {}
+        # PDF polling is only a fallback; keep it infrequent so CSV handlers are not starved.
+        self._poll_interval_sec = 30.0
+        self._next_poll_at = 0.0
+        self._next_poll_log_at = 0.0
 
     def ignore_existing_pdfs(self, input_dir: Path) -> None:
         """Record existing PDFs so only new/changed-after-start files process."""
@@ -1296,12 +1517,13 @@ class PDFHandler(FileSystemEventHandler):
     def _process_if_pdf(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".pdf":
             return
+        if not _pdf_watch_enabled_now():
+            return
 
         key = str(path).lower()
         current_sig = _file_signature(path)
         baseline_sig = self._existing_pdf_signatures.get(key)
         if baseline_sig is not None and current_sig == baseline_sig:
-            self.logger.info("[%s] Ignoring existing startup file unchanged since watcher start: %s", self.retailer, path.name)
             return
         if baseline_sig is not None and current_sig != baseline_sig:
             self._existing_pdf_signatures.pop(key, None)
@@ -1326,6 +1548,30 @@ class PDFHandler(FileSystemEventHandler):
             self.logger.exception(
                 "[%s] Unhandled error processing %s: %s", self.retailer, path.name, e
             )
+
+    def poll_input_dir(self, input_dir: Path) -> None:
+        """Fallback polling for network shares where file events are often missed."""
+        if not _pdf_watch_enabled_now():
+            return
+        now = time.monotonic()
+        if now < self._next_poll_at:
+            return
+        self._next_poll_at = now + self._poll_interval_sec
+        try:
+            pending = sorted(input_dir.glob("*.pdf"), key=lambda p: p.name.lower())
+        except Exception as e:
+            self.logger.error("[%s] Poll failed for %s: %s", self.retailer, input_dir, e)
+            return
+        if now >= self._next_poll_log_at:
+            self._next_poll_log_at = now + 60.0
+            self.logger.info(
+                "[%s] Poll heartbeat: %d PDF file(s) visible in %s",
+                self.retailer,
+                len(pending),
+                input_dir,
+            )
+        for fp in pending:
+            self._process_if_pdf(fp, "polled")
 
     def on_created(self, event) -> None:  # type: ignore[override]
         if event.is_directory:
@@ -1410,6 +1656,8 @@ class DepotCSVHandler(FileSystemEventHandler):
     def _process_if_csv(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".csv":
             return
+        if not _csv_watch_enabled_now():
+            return
 
         key = str(path).lower()
         current_sig = _file_signature(path)
@@ -1459,6 +1707,8 @@ class DepotCSVHandler(FileSystemEventHandler):
 
     def poll_input_dir(self, input_dir: Path) -> None:
         """Fallback polling for network shares where file events can be missed."""
+        if not _csv_watch_enabled_now():
+            return
         now = time.monotonic()
         if now < self._next_poll_at:
             return
@@ -1479,6 +1729,215 @@ class DepotCSVHandler(FileSystemEventHandler):
                 len(self.rules),
             )
 
+        for fp in pending:
+            self._process_if_csv(fp, "polled")
+
+    def on_created(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_csv(Path(event.src_path), "new")
+
+    def on_moved(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_csv(Path(event.dest_path), "moved")
+
+    def on_modified(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._process_if_csv(Path(event.src_path), "modified")
+
+
+class LoweFedexCSVHandler(FileSystemEventHandler):
+    """Watch ``LOWES_FEDEX_CSV_INPUT_DIR`` for raw Lowe's CSVs and emit FedEx upload workbooks."""
+
+    def __init__(
+        self,
+        mapping_path: Path,
+        weights_path: Path,
+        output_dir: Path,
+        archive_dir: Path,
+        dry_run: bool,
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__()
+        self.mapping_path = mapping_path
+        self.weights_path = weights_path
+        self.output_dir = output_dir
+        self.archive_dir = archive_dir
+        self.dry_run = dry_run
+        self.logger = logger
+        self._existing_csv_signatures: dict[str, tuple[int, int, int]] = {}
+        self._processed_csv_sha256: dict[str, str] = {}
+        self._processed_stem_sha256: dict[str, str] = {}
+        self._lowe_csv_lock = threading.Lock()
+        self._lowe_csv_inflight: set[str] = set()
+        self._last_seen: dict[str, float] = {}
+        self._failure_quiet_until: dict[str, float] = {}
+        self._poll_interval_sec = 5.0
+        self._next_poll_at = 0.0
+        self._next_poll_log_at = 0.0
+
+    def _resolve_mapping_path(self) -> Path:
+        if self.mapping_path.exists():
+            return self.mapping_path
+        candidates = sorted(self.mapping_path.parent.glob("*mapping*.xlsx"), key=lambda p: p.name.lower())
+        if candidates:
+            return candidates[0]
+        return self.mapping_path
+
+    def _resolve_weights_path(self) -> Path:
+        if self.weights_path.exists():
+            return self.weights_path
+        candidates = sorted(self.weights_path.parent.glob("*weights*.xlsx"), key=lambda p: p.name.lower())
+        if candidates:
+            return candidates[0]
+        return self.weights_path
+
+    def ignore_existing_csvs(self, input_dir: Path) -> None:
+        pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
+        if not pending:
+            self.logger.info("[Lowe's FedEx CSV] No existing CSV files at startup in %s", input_dir)
+            return
+        recorded = 0
+        for fp in pending:
+            sig = _file_signature(fp)
+            if sig is None:
+                continue
+            k = _csv_watch_path_key(fp)
+            self._existing_csv_signatures[k] = sig
+            h = _sha256_file(fp)
+            if h:
+                self._processed_csv_sha256[k] = h
+                self._processed_stem_sha256[fp.stem.lower()] = h
+            recorded += 1
+        self.logger.info(
+            "[Lowe's FedEx CSV] Ignoring %d existing CSV file(s) at startup; only new/changed files will process",
+            recorded,
+        )
+
+    def _process_if_csv(self, path: Path, event_label: str) -> None:
+        if path.suffix.lower() != ".csv":
+            return
+        if not _csv_watch_enabled_now():
+            return
+        st = path.stem.lower()
+        if st.endswith(" input") or st.endswith("_input"):
+            return
+        if st.endswith(" output") or st.endswith("_output"):
+            return
+        if _path_is_same_or_under(path, self.archive_dir) or _path_is_same_or_under(path, self.output_dir):
+            return
+        stem_key = st
+        if time.monotonic() < self._failure_quiet_until.get(stem_key, 0.0):
+            return
+        key = _csv_watch_path_key(path)
+        current_sig = _file_signature(path)
+        if current_sig is None:
+            return
+        baseline_sig = self._existing_csv_signatures.get(key)
+        if baseline_sig is not None and current_sig == baseline_sig:
+            self.logger.info(
+                "[Lowe's FedEx CSV] Ignoring existing startup file unchanged since watcher start: %s",
+                path.name,
+            )
+            return
+        if baseline_sig is not None and current_sig != baseline_sig:
+            self._existing_csv_signatures.pop(key, None)
+
+        now = time.monotonic()
+        if now - self._last_seen.get(key, 0.0) < 45.0:
+            return
+        self._last_seen[key] = now
+
+        mapping_path = self._resolve_mapping_path()
+        weights_path = self._resolve_weights_path()
+        if not mapping_path.exists():
+            self.logger.error("[Lowe's FedEx CSV] Mapping workbook missing: %s", mapping_path)
+            return
+        if not weights_path.exists():
+            self.logger.error("[Lowe's FedEx CSV] Weights workbook missing: %s", weights_path)
+            return
+
+        if not _wait_for_file_ready(path):
+            self.logger.error("[Lowe's FedEx CSV] Timed out waiting for %s — skipping.", path.name)
+            return
+
+        content_hash = _sha256_file(path)
+        if content_hash is None:
+            return
+
+        with self._lowe_csv_lock:
+            if self._processed_csv_sha256.get(key) == content_hash:
+                return
+            if self._processed_stem_sha256.get(stem_key) == content_hash:
+                return
+            if key in self._lowe_csv_inflight:
+                return
+            self._lowe_csv_inflight.add(key)
+        try:
+            self.logger.info("[Lowe's FedEx CSV] Detected %s file: %s", event_label, path.name)
+            try:
+                out_path, out_rows, unknown_skus, archived_to = lowes_fedex_csv.process_one_csv(
+                    raw_csv=path,
+                    mapping_xlsx=mapping_path,
+                    weights_xlsx=weights_path,
+                    output_dir=self.output_dir,
+                    archive_dir=self.archive_dir,
+                    dry_run=self.dry_run,
+                )
+                if self.dry_run:
+                    self.logger.info(
+                        "[Lowe's FedEx CSV] DRY RUN for %s → would create %d row(s)",
+                        path.name,
+                        out_rows,
+                    )
+                else:
+                    self.logger.info(
+                        "[Lowe's FedEx CSV] Processed %s -> %s (%d rows)",
+                        path.name,
+                        out_path,
+                        out_rows,
+                    )
+                    self.logger.info(
+                        "[Lowe's FedEx CSV] Raw CSV moved to archive (removed from input) -> %s",
+                        archived_to,
+                    )
+                if unknown_skus:
+                    self.logger.warning(
+                        "[Lowe's FedEx CSV] %d source row(s) skipped (SKU not in weights workbook)",
+                        unknown_skus,
+                    )
+                with self._lowe_csv_lock:
+                    self._processed_csv_sha256[key] = content_hash
+                    self._processed_stem_sha256[stem_key] = content_hash
+                self._failure_quiet_until.pop(stem_key, None)
+            except Exception as e:
+                self.logger.exception("[Lowe's FedEx CSV] Error processing %s: %s", path.name, e)
+                self._failure_quiet_until[stem_key] = time.monotonic() + 300.0
+        finally:
+            with self._lowe_csv_lock:
+                self._lowe_csv_inflight.discard(key)
+
+    def poll_input_dir(self, input_dir: Path) -> None:
+        if not _csv_watch_enabled_now():
+            return
+        now = time.monotonic()
+        if now < self._next_poll_at:
+            return
+        self._next_poll_at = now + self._poll_interval_sec
+        try:
+            pending = sorted(input_dir.glob("*.csv"), key=lambda p: p.name.lower())
+        except Exception as e:
+            self.logger.error("[Lowe's FedEx CSV] Poll failed for %s: %s", input_dir, e)
+            return
+        if now >= self._next_poll_log_at:
+            self._next_poll_log_at = now + 60.0
+            self.logger.info(
+                "[Lowe's FedEx CSV] Poll heartbeat: %d CSV file(s) in %s",
+                len(pending),
+                input_dir,
+            )
         for fp in pending:
             self._process_if_csv(fp, "polled")
 
@@ -1532,10 +1991,19 @@ class LabelHandler(FileSystemEventHandler):
         self._poll_interval_sec = 5.0
         self._next_poll_at = 0.0
         self._next_poll_log_at = 0.0
-        # Build fast lookup: normalised input_path string → route
-        self._route_by_input: dict[str, LabelVendorRoute] = {
-            str(r.input_path).lower(): r for r in routes
-        }
+        # Several keys per route: raw str, normpath, and resolve() when possible (SMB/Excel mismatch).
+        self._route_by_input: dict[str, LabelVendorRoute] = {}
+        for r in routes:
+            keys: set[str] = set()
+            keys.add(str(r.input_path).rstrip("\\/").lower())
+            keys.add(_normalized_dir_key(r.input_path))
+            try:
+                keys.add(_normalized_dir_key(r.input_path.resolve(strict=False)))
+            except OSError:
+                pass
+            for k in keys:
+                if k:
+                    self._route_by_input[k] = r
         self._load_label_dedupe_state()
 
     def _load_label_dedupe_state(self) -> None:
@@ -1600,7 +2068,28 @@ class LabelHandler(FileSystemEventHandler):
 
     def _route_for_path(self, path: Path) -> LabelVendorRoute | None:
         """Return the route whose input_path matches the file's parent directory."""
-        return self._route_by_input.get(str(path.parent).lower())
+        parent = path.parent
+        keys: list[str] = [
+            str(parent).rstrip("\\/").lower(),
+            _normalized_dir_key(parent),
+        ]
+        try:
+            keys.append(_normalized_dir_key(parent.resolve(strict=False)))
+        except OSError:
+            pass
+        for k in keys:
+            r = self._route_by_input.get(k)
+            if r is not None:
+                return r
+        # PDF saved one level under the configured Input folder (parent is a subdir of input_path).
+        pnorm = _normalized_dir_key(parent)
+        for r in self.routes:
+            root = _normalized_dir_key(r.input_path)
+            if not root:
+                continue
+            if pnorm == root or pnorm.startswith(root + os.sep):
+                return r
+        return None
 
     def _vendor_fallback(self, path: Path) -> str:
         """Derive vendor name from the immediate parent folder (fallback only)."""
@@ -1626,7 +2115,11 @@ class LabelHandler(FileSystemEventHandler):
 
         for scan_root in paths_to_scan:
             try:
-                for fp in scan_root.rglob("*.pdf"):
+                if self.routes:
+                    to_scan = _label_pdfs_in_input_folder(scan_root)
+                else:
+                    to_scan = list(scan_root.rglob("*.pdf"))
+                for fp in to_scan:
                     sig = _file_signature(fp)
                     if sig is None:
                         continue
@@ -1640,6 +2133,8 @@ class LabelHandler(FileSystemEventHandler):
 
     def _process_if_label(self, path: Path, event_label: str) -> None:
         if path.suffix.lower() != ".pdf":
+            return
+        if not _label_watch_enabled_now():
             return
 
         key = str(path).lower()
@@ -1768,6 +2263,8 @@ class LabelHandler(FileSystemEventHandler):
 
     def poll_all_inputs(self) -> None:
         """Polling fallback for network shares where file-system events can be missed."""
+        if not _label_watch_enabled_now():
+            return
         now = time.monotonic()
         if now < self._next_poll_at:
             return
@@ -1777,7 +2274,7 @@ class LabelHandler(FileSystemEventHandler):
             pending: list[Path] = []
             for r in self.routes:
                 try:
-                    pending.extend(r.input_path.glob("*.pdf"))
+                    pending.extend(_label_pdfs_in_input_folder(r.input_path))
                 except Exception as e:
                     self.logger.error("[Labels] Poll failed for %s: %s", r.input_path, e)
         else:
@@ -1820,7 +2317,52 @@ def main() -> None:
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    log_file = os.environ.get("ORDER_SPLITTER_LOG_FILE", "").strip()
+    if log_file:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(
+            logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logging.getLogger().addHandler(fh)
+
     logger = logging.getLogger("watcher")
+    if log_file:
+        logger.info("Also logging to %s (set by ORDER_SPLITTER_LOG_FILE)", log_file)
+
+    _apply_watcher_sidecar_settings(logger)
+    _apply_watcher_cli_env_from_argv(sys.argv)
+
+    master_ok = _master_automation_allowed_now()
+    csv_env_on = _csv_env_enabled_now()
+    pdf_env_on = _pdf_env_enabled_now()
+    label_env_on = _label_env_enabled_now()
+
+    if not _acquire_watcher_instance_lock(logger):
+        return
+
+    logger.info(
+        "[Automation master] AUTOMATION_STOP.txt + DISABLE_ALL_AUTOMATION → %s (%s)",
+        "RUN" if master_ok else "PAUSED",
+        _AUTOMATION_STOP_FILE,
+    )
+    logger.info(
+        "[CSV watcher] ORDER_SPLITTER_DISABLE_CSV_WATCH=%r → Depot + Lowe's FedEx env %s (effective %s)",
+        os.environ.get("ORDER_SPLITTER_DISABLE_CSV_WATCH", ""),
+        "ON" if csv_env_on else "OFF",
+        "ON" if (master_ok and csv_env_on) else "OFF",
+    )
+    logger.info(
+        "[PDF watcher] ORDER_SPLITTER_DISABLE_PDF_WATCH=%r → packing-slip PDFs env %s (effective %s)",
+        os.environ.get("ORDER_SPLITTER_DISABLE_PDF_WATCH", ""),
+        "ON" if pdf_env_on else "OFF",
+        "ON" if (master_ok and pdf_env_on) else "OFF",
+    )
+    logger.info(
+        "[PDF watcher — WorldShip labels] ORDER_SPLITTER_DISABLE_LABEL_WATCH=%r → labels env %s (effective %s)",
+        os.environ.get("ORDER_SPLITTER_DISABLE_LABEL_WATCH", ""),
+        "ON" if label_env_on else "OFF",
+        "ON" if _label_watch_enabled_now() else "OFF",
+    )
     routes = load_vendor_output_routes(ROUTES_XLSX_PATH, logger)
     route_dirs = list({p for p in routes.values()})
 
@@ -1831,6 +2373,10 @@ def main() -> None:
         CSV_INPUT_DIR,
         CSV_OUTPUT_DIR,
         CSV_ARCHIVE_DIR,
+        LOWES_FEDEX_CSV_INPUT_DIR,
+        LOWES_FEDEX_CSV_OUTPUT_DIR,
+        LOWES_FEDEX_CSV_ARCHIVE_DIR,
+        LOWES_FEDEX_CONFIG_DIR,
         LABEL_WATCH_ROOT,
     ]
 
@@ -1840,7 +2386,19 @@ def main() -> None:
         return
 
     # Ensure all directories exist
-    for d in [*WATCH_DIRS.values(), *OUTPUT_DIRS.values(), *route_dirs, CSV_INPUT_DIR, CSV_OUTPUT_DIR, CSV_ARCHIVE_DIR, LABEL_WATCH_ROOT]:
+    for d in [
+        *WATCH_DIRS.values(),
+        *OUTPUT_DIRS.values(),
+        *route_dirs,
+        CSV_INPUT_DIR,
+        CSV_OUTPUT_DIR,
+        CSV_ARCHIVE_DIR,
+        LOWES_FEDEX_CSV_INPUT_DIR,
+        LOWES_FEDEX_CSV_OUTPUT_DIR,
+        LOWES_FEDEX_CSV_ARCHIVE_DIR,
+        LOWES_FEDEX_CONFIG_DIR,
+        LABEL_WATCH_ROOT,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Reset the daily vendor rollup at startup and then once per day if the
@@ -1850,23 +2408,27 @@ def main() -> None:
     crop_cfg = load_crop_config()
 
     observer = Observer()
+    pdf_handlers: list[tuple[PDFHandler, Path]] = []
 
-    if not PDF_WATCH_ENABLED and not CSV_WATCH_ENABLED and not LABEL_WATCH_ENABLED:
-        logger.error("All PDF, CSV, and Label watchers are disabled by environment settings.")
+    if not pdf_env_on and not csv_env_on:
+        logger.error(
+            "Nothing to do: PDF watcher (packing slips + labels) and CSV watcher (Depot + Lowe's) are all off in env.",
+        )
         return
 
-    if PDF_WATCH_ENABLED:
+    if pdf_env_on:
         for retailer, watch_dir in WATCH_DIRS.items():
             handler = PDFHandler(retailer, crop_cfg, OUTPUT_DIRS[retailer], routes, logger)
             handler.ignore_existing_pdfs(watch_dir)
             observer.schedule(handler, str(watch_dir), recursive=False)
+            pdf_handlers.append((handler, watch_dir))
             logger.info("Watching [%-14s] → %s/", retailer, watch_dir)
             logger.info("Output   [%-14s] → %s/", retailer, OUTPUT_DIRS[retailer])
     else:
-        logger.info("PDF watcher disabled by ORDER_SPLITTER_DISABLE_PDF_WATCH")
+        logger.info("[PDF watcher] Off — ORDER_SPLITTER_DISABLE_PDF_WATCH (packing slips and labels both off)")
 
     csv_handler: DepotCSVHandler | None = None
-    if CSV_WATCH_ENABLED:
+    if csv_env_on:
         csv_handler = DepotCSVHandler(
             rules_path=CSV_RULES_XLSX_PATH,
             output_dir=CSV_OUTPUT_DIR,
@@ -1885,10 +2447,35 @@ def main() -> None:
         logger.info("CSV rules file          → %s", csv_handler.rules_path)
         logger.info("CSV dry-run mode        → %s", CSV_DRY_RUN)
     else:
-        logger.info("CSV watcher disabled by ORDER_SPLITTER_DISABLE_CSV_WATCH")
+        logger.info("[CSV watcher] Off — ORDER_SPLITTER_DISABLE_CSV_WATCH (Depot + Lowe's FedEx)")
+
+    lowes_fedex_handler: LoweFedexCSVHandler | None = None
+    if csv_env_on:
+        lowes_fedex_handler = LoweFedexCSVHandler(
+            mapping_path=LOWES_FEDEX_MAPPING_XLSX,
+            weights_path=LOWES_FEDEX_WEIGHTS_XLSX,
+            output_dir=LOWES_FEDEX_CSV_OUTPUT_DIR,
+            archive_dir=LOWES_FEDEX_CSV_ARCHIVE_DIR,
+            dry_run=CSV_DRY_RUN,
+            logger=logger,
+        )
+        logger.info("[Lowe's FedEx CSV] Input folder exists: %s", LOWES_FEDEX_CSV_INPUT_DIR.exists())
+        logger.info("[Lowe's FedEx CSV] Output folder exists: %s", LOWES_FEDEX_CSV_OUTPUT_DIR.exists())
+        logger.info("[Lowe's FedEx CSV] Archive folder exists: %s", LOWES_FEDEX_CSV_ARCHIVE_DIR.exists())
+        lowes_fedex_handler.ignore_existing_csvs(LOWES_FEDEX_CSV_INPUT_DIR)
+        observer.schedule(lowes_fedex_handler, str(LOWES_FEDEX_CSV_INPUT_DIR), recursive=False)
+        logger.info("Watching [Lowe's FedEx CSV] → %s/", LOWES_FEDEX_CSV_INPUT_DIR)
+        logger.info("Lowe's FedEx output      → %s/", LOWES_FEDEX_CSV_OUTPUT_DIR)
+        logger.info("Lowe's FedEx archive     → %s/", LOWES_FEDEX_CSV_ARCHIVE_DIR)
+        logger.info("Lowe's FedEx mapping     → %s", LOWES_FEDEX_MAPPING_XLSX)
+        logger.info("Lowe's FedEx weights     → %s", LOWES_FEDEX_WEIGHTS_XLSX)
+        logger.info("Lowe's FedEx dry-run     → %s (same flag as Depot CSV)", CSV_DRY_RUN)
+        logger.info("[Lowe's FedEx CSV] Code module: %s", lowes_fedex_csv.__file__)
+    else:
+        logger.info("[Lowe's FedEx CSV] Off — same CSV watcher switch as Depot (ORDER_SPLITTER_DISABLE_CSV_WATCH)")
 
     label_handler: LabelHandler | None = None
-    if PDF_WATCH_ENABLED and LABEL_WATCH_ENABLED:
+    if pdf_env_on and label_env_on:
         label_routes = load_label_vendor_routes(LABEL_ROUTES_XLSX_PATH, logger)
         label_handler = LabelHandler(label_routes, logger)
         label_handler.ignore_existing_labels()
@@ -1913,20 +2500,26 @@ def main() -> None:
             LABEL_WATCH_ROOT.mkdir(parents=True, exist_ok=True)
             observer.schedule(label_handler, str(LABEL_WATCH_ROOT), recursive=True)
             logger.info("Watching [Labels        ] → %s/ (recursive, no routes config)", LABEL_WATCH_ROOT)
-    elif not PDF_WATCH_ENABLED:
-        logger.info("Label watcher skipped (requires PDF watcher to be enabled)")
+    elif not pdf_env_on:
+        logger.info("[PDF watcher — WorldShip labels] Skipped (PDF watcher is off)")
     else:
-        logger.info("Label watcher disabled by ORDER_SPLITTER_DISABLE_LABEL_WATCH")
+        logger.info("[PDF watcher — WorldShip labels] Skipped — ORDER_SPLITTER_DISABLE_LABEL_WATCH")
 
     logger.info("Daily rollup output     → %s/", DAILY_VENDOR_ROLLUP_ROOT)
 
-    logger.info("Watcher running. Drop PDF/CSV files into configured watch folders. Press Ctrl+C to stop.\n")
+    logger.info(
+        "watcher.py running — PDF and CSV stacks only process files while this process stays up. Press Ctrl+C to stop.\n",
+    )
 
     observer.start()
     try:
         while True:
             if csv_handler is not None:
                 csv_handler.poll_input_dir(CSV_INPUT_DIR)
+            if lowes_fedex_handler is not None:
+                lowes_fedex_handler.poll_input_dir(LOWES_FEDEX_CSV_INPUT_DIR)
+            for handler, watch_dir in pdf_handlers:
+                handler.poll_input_dir(watch_dir)
             if label_handler is not None:
                 label_handler.poll_all_inputs()
             time.sleep(1)

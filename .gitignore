@@ -1,0 +1,11 @@
+# Local pause flag (do not commit — machine-specific)
+AUTOMATION_STOP.txt
+.watcher_instance.lock
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+*.log
+.depot_csv_watch_state.json
