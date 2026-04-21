@@ -1,11 +1,8 @@
 """
-Standalone Depot CSV watcher (Depot input folder only).
+Standalone Depot CSV watcher.
 
-Lowe's FedEx CSV automation lives only in ``watcher.py`` with the CSV watcher enabled.
-
-For the intended split (PDF watcher = packing slips + labels; CSV watcher = Depot + Lowe's),
-use ``watcher.py`` with ``ORDER_SPLITTER_DISABLE_CSV_WATCH`` unset and launch via ``run_watcher.cmd``,
-or CSV-only via ``run_csv_orders_only.cmd``. This script exists for Depot-only scheduled tasks.
+This script is intentionally independent from watcher.py so CSV processing can run
+reliably on its own schedule/task without PDF watcher complexity.
 
 Behavior:
 - Polls Depot CSV input folder every few seconds.

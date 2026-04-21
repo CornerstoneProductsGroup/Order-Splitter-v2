@@ -1,10 +1,6 @@
 @echo off
 setlocal
 
-rem Full watcher: PDF watcher (retailer packing-slip PDFs + WorldShip label sizing)
-rem              + CSV watcher (Depot + Lowe's FedEx). See watcher.py module docstring.
-rem Optional env: ORDER_SPLITTER_DISABLE_PDF_WATCH, ORDER_SPLITTER_DISABLE_CSV_WATCH, ORDER_SPLITTER_DISABLE_LABEL_WATCH
-
 rem Always run from this script's folder
 cd /d "%~dp0"
 
